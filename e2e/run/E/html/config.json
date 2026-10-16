@@ -1,0 +1,24 @@
+{
+  
+  
+  "apiUrl": "/api",
+  "geoserverUrl": "/geoserver",
+  "basemapTiles": "http://127.0.0.1:8600/tiles/{z}/{x}/{y}.png",
+  "mapCenter": [12.5, 41.9],
+  
+  "basemaps": [{"id":"osm","label":"Mappa","tiles":"http://127.0.0.1:8600/tiles/{z}/{x}/{y}.png","attribution":"© test"},{"id":"nessuno","label":"Vuoto","tiles":"","attribution":""},{"id":"rotto","label":"Rotto","tiles":"ftp://x","attribution":""}],
+  
+  "mapZoom": 9,
+  "title": "Test ricerca",
+  "logo": "",
+  "logoHeight": 28,
+  "partnerLogos": [],
+  "favicon": "",
+  "logoShowTitle": false,
+  "headerColor": "",
+  "partnerLogosBg": "",
+  "accent": "",
+  "editEnabled": false,
+  "editRole": "",
+  "terrainTiles": ""
+}

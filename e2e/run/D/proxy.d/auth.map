@@ -1,0 +1,4 @@
+map $request_method $gs_auth {
+  default "Basic cmVhZGVyOnJwYXNz";
+  POST    "Basic cmVhZGVyOnJwYXNz";
+}

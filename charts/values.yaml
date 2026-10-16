@@ -1,0 +1,83 @@
+replicaCount: 1
+
+image:
+  repository: registy.gema.example.it
+  tag: "dev"
+  pullPolicy: Always
+imagePullSecrets: 
+  - name: credential-registry
+env:
+  - name: AUTH_ENABLED 
+    value: "true"
+  - name: KEYCLOAK_REALM
+    value: myrealm
+  - name: KEYCLOAK_CLIENT_ID
+    value: myclient
+  - name: GEOSERVER_PROXY_URL
+    value: https://geoserver.gema.example.it/geoserver
+  - name: ACCESS_CONTROL
+    value: "true"
+  - name: ADMIN_ROLE
+    value: mykeycloak-admin
+  - name: VIEWER_ROLE
+    value: mykeycloak-viewer
+  - name: KNOWN_ROLES # ruoli dalla UI
+    value: mykeycloak-viewer
+  - name: CONFIG_WORKSPACE
+    value: geolibre-workspace 
+  - name: GEOSERVER_WRITE_PASSTHROUGH
+    value: "false"
+  - name: LOGO_URL
+    value: "/logos/gema-logo-header.svg"
+  - name: APP_TITLE
+    value: "G.E.M.A"
+  - name: PARTNER_LOGOS #è una lista 
+    value: "/logos/partner1_logo.png,/logos/partner2_logo.png,/logos/partner3_logo.png"
+  - name: LOGO_HEIGHT
+    value: "32"
+  - name: FAVICON_URL
+    value: "/logos/gema-favicon.ico"
+  - name: APP_ACCENT
+    value: "#0f766e"
+  - name: APP_HEADER_COLOR
+    value: "#08181c"
+  - name: PARTNER_LOGOS_BG
+    value: "none"
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080       
+
+auth:
+  enabled: false
+  image: quay.io/oauth2-proxy/oauth2-proxy:v7.9.0
+  clientId: myclient
+  clientRole: mykeycloak-role
+  existingSecret: gema-oidc
+  resources:
+    requests: { cpu: 25m, memory: 32Mi }
+    limits:   { cpu: 200m, memory: 128Mi }
+
+apisixRoute:
+  enabled: true
+
+resources:
+  requests: { cpu: 100m, memory: 256Mi }
+  limits:   { cpu: "1", memory: 1Gi }
+
+eso: 
+  secretStoreName: existingsecretstore
+  path: vaultpath/gema/secret
+  existingSecret: gema-secret
+  secrets: 
+    - OAUTH2_PROXY_COOKIE_SECRET
+    - OIDC_CLIENT_SECRET
+    - GEOSERVER_PASSWORD
+    - GEOSERVER_USER
+
+postgres: 
+  host: postgres.svc.cluster.local
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

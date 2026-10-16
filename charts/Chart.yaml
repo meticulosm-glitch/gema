@@ -1,0 +1,6 @@
+apiVersion: v2
+name: geolibre
+description: GeoLibre web (nginx + sidecar Python) protetto da Keycloak tramite oauth2-proxy
+type: application
+version: 0.1.0
+appVersion: "main"

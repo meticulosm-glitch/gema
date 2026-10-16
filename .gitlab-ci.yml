@@ -1,0 +1,52 @@
+include:
+  - project: "public-includes/pipelines-template"
+    ref: main
+    file: "docker.gitlab-ci.yml"
+
+variables:
+  # e2e/ contiene solo mock per i test (non finisce nell'immagine): escluso dalle scansioni SAST
+  SAST_EXCLUDED_PATHS: "spec, test, tests, tmp, e2e"
+
+deploy:
+  stage: push_version
+  variables:
+    CHART_FOLDER: sample-iride-app # CHANGE ME to the name of the folder inside `charts/` that contains your app's Helm chart
+  trigger:
+    project: $CI_PROJECT_ROOT_NAMESPACE/templates/applications-and-runners/oci-helm-template # CHANGE ME to the Helm project's path that's in charge of deploying your app
+    branch: main
+  # COMMENT the following lines to enable the `deploy` job when there's a related Helm project for deploying the app
+  rules:
+    - when: never
+
+unit_test_job:
+  stage: test
+  image: node:22-alpine
+  script:
+    - npm ci --include=dev
+    - npm test
+  rules:
+    - if: $CI_COMMIT_REF_PROTECTED == 'false'
+
+integration_test_job:
+  stage: test
+  script:
+    - echo "🗒️ Placeholder for integration tests"
+  rules:
+    - if: $CI_COMMIT_REF_PROTECTED == 'false'
+
+build_tmp_image_job:
+  variables:
+    DOCKER_ARGS: "--no-cache"
+ 
+rebuild_and_push_image_to_dev:
+  variables:
+    DOCKER_ARGS: "--no-cache"
+ 
+rebuild_and_push_image_to_uat:
+  variables:
+    DOCKER_ARGS: "--no-cache"
+ 
+promote_image_to_prod:
+  variables:
+    DOCKER_ARGS: "--no-cache"
+ 

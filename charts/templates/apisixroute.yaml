@@ -1,0 +1,19 @@
+{{- if .Values.apisixRoute.enabled }}
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: {{ include "geolibre.fullname" . }}
+  labels:
+    {{- include "geolibre.labels" . | nindent 4 }}
+spec:
+  http:
+    - name: {{ include "geolibre.fullname" . }}
+      match:
+        hosts:
+          - {{ .Values.apisixRoute.host | quote }}
+        paths:
+          - /*
+      backends:
+        - serviceName: {{ include "geolibre.fullname" . }}
+          servicePort: {{ .Values.service.port }}
+{{- end }}

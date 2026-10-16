@@ -1,0 +1,274 @@
+# ConfigMap con lo script SQL e i due script di inizializzazione di mapp-web.
+# Il contenuto è la fonte unica: lo legge il Job mapp-config-init (job.yaml).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mapp-config-init
+  labels:
+    app.kubernetes.io/name: mapp-web
+    app.kubernetes.io/component: config-init
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"   # prima del Job
+data:
+  mapp-config.sql: |
+    -- Tabelle di configurazione di mapp-web (ruoli -> permessi, dashboard, viste salvate). Idempotente: si può rieseguire.
+    -- Variabili psql (le passa init-db.sh):
+    --   schema   schema che contiene le tabelle (default gema_config)
+    --   gs_user  utente PostgreSQL del datastore GeoServer (la password arriva dall'ambiente, GS_DB_PASSWORD)
+    CREATE SCHEMA IF NOT EXISTS :"schema";
+
+    CREATE TABLE IF NOT EXISTS :"schema".role_rules (
+      id          serial PRIMARY KEY,
+      role        text NOT NULL UNIQUE,
+      layers      text NOT NULL DEFAULT '[]',   -- JSON: ["iride:parcels", ...] oppure ["*"] per tutti
+      tools       text NOT NULL DEFAULT '[]',   -- JSON: ["info","table","edit", ...]
+      updated_by  text,
+      updated_at  timestamptz DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS :"schema".dashboards (
+      id          serial PRIMARY KEY,
+      title       text NOT NULL,
+      description text NOT NULL DEFAULT '',
+      roles       text NOT NULL DEFAULT '[]',   -- JSON: ruoli che vedono la dashboard
+      definition  text NOT NULL DEFAULT '[]',   -- JSON: elenco dei widget
+      updated_by  text,
+      updated_at  timestamptz DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS :"schema".saved_views (
+      id          serial PRIMARY KEY,
+      owner       text NOT NULL,                -- utente Keycloak (preferred_username) proprietario della vista
+      name        text NOT NULL,
+      definition  text NOT NULL DEFAULT '{}',   -- JSON: layer attivi con filtro/data/stile/opacità, sfondo, inquadratura
+      created_at  timestamptz DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS saved_views_owner_idx ON :"schema".saved_views (owner);
+
+    -- Utente applicativo = quello che GeoServer usa per il datastore. Se è diverso da chi esegue lo script (l'admin):
+    --   * viene creato se manca (solo LOGIN, nessun altro privilegio) e la sua password è allineata a GS_DB_PASSWORD;
+    --   * riceve solo i diritti sul database, sullo schema e sulle sue tabelle (anche su quelle create in futuro).
+    SELECT (:'gs_user' <> '' AND :'gs_user' <> current_user) AS grant_gs \gset
+    \if :grant_gs
+    \set gs_password ''
+    \getenv gs_password GS_DB_PASSWORD
+    SELECT format('CREATE ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD %L', :'gs_user', :'gs_password')
+      WHERE :'gs_password' <> '' AND NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'gs_user') \gexec
+    SELECT format('ALTER ROLE %I PASSWORD %L', :'gs_user', :'gs_password')
+      WHERE :'gs_password' <> '' AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'gs_user') \gexec
+    SELECT format('GRANT CONNECT ON DATABASE %I TO %I', current_database(), :'gs_user') \gexec
+    GRANT USAGE ON SCHEMA :"schema" TO :"gs_user";
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA :"schema" TO :"gs_user";
+    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA :"schema" TO :"gs_user";
+    ALTER DEFAULT PRIVILEGES IN SCHEMA :"schema" GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO :"gs_user";
+    ALTER DEFAULT PRIVILEGES IN SCHEMA :"schema" GRANT USAGE, SELECT ON SEQUENCES TO :"gs_user";
+    \endif
+
+  init-db.sh: |
+    #!/bin/sh
+    # Passo 1: crea (se serve) database, tabelle e utente applicativo. Idempotente.
+    # Usa DUE utenze diverse:
+    #   PG_ADMIN_USER / PG_ADMIN_PASSWORD   amministratore: CREATE DATABASE, schema, tabelle, ruolo applicativo
+    #   GS_DB_USER / GS_DB_PASSWORD         utente applicativo (quello del datastore GeoServer): creato qui se manca,
+    #                                       con i soli diritti sulle tabelle di configurazione
+    set -eu
+
+    : "${PGHOST:?PGHOST mancante}" "${PG_ADMIN_USER:?PG_ADMIN_USER mancante}" "${PG_ADMIN_PASSWORD:?PG_ADMIN_PASSWORD mancante}"
+    export PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-5}"
+    psql_admin() { PGPASSWORD="$PG_ADMIN_PASSWORD" psql -U "$PG_ADMIN_USER" "$@"; }
+    DB="${MAPP_DB:-gema_config}"
+    SCHEMA="${MAPP_SCHEMA:-gema_config}"
+    GS_USER="${GS_DB_USER:-}"
+
+    # i nomi finiscono in SQL come identificatori: solo caratteri semplici
+    for v in "$DB" "$SCHEMA" "$GS_USER"; do
+      case "$v" in
+        "") ;;
+        [0-9]*|*[!A-Za-z0-9_]*) echo "[init-db] nome non valido: '$v' (ammessi lettere, cifre e _)" >&2; exit 2 ;;
+      esac
+    done
+    [ "$GS_USER" != "$PG_ADMIN_USER" ] || echo "[init-db] ATTENZIONE: utente applicativo e amministratore coincidono: GeoServer userebbe l'utenza di amministrazione"
+
+    echo "[init-db] attendo PostgreSQL su ${PGHOST}:${PGPORT:-5432} ..."
+    i=0
+    until psql_admin -d postgres -Atqc "SELECT 1" >/dev/null 2>&1 || psql_admin -d "$DB" -Atqc "SELECT 1" >/dev/null 2>&1; do
+      i=$((i + 1))
+      [ "$i" -le "${WAIT_TRIES:-60}" ] || { echo "[init-db] PostgreSQL non raggiungibile (utente $PG_ADMIN_USER)" >&2; psql_admin -d postgres -Atqc "SELECT 1" >&2 || true; exit 1; }
+      sleep 5
+    done
+
+    if [ "${DB_CREATE:-false}" = "true" ]; then
+      if [ "$(psql_admin -d postgres -Atqc "SELECT 1 FROM pg_database WHERE datname = '$DB'")" = "1" ]; then
+        echo "[init-db] database $DB già presente"
+      else
+        echo "[init-db] creo il database $DB"
+        psql_admin -d postgres -v ON_ERROR_STOP=1 -qc "CREATE DATABASE \"$DB\""
+      fi
+    fi
+
+    # l'utente applicativo deve esistere o poter essere creato (serve la password)
+    if [ -n "$GS_USER" ] && [ "$GS_USER" != "$PG_ADMIN_USER" ] && [ -z "${GS_DB_PASSWORD:-}" ]; then
+      if [ "$(psql_admin -d postgres -Atqc "SELECT 1 FROM pg_roles WHERE rolname = '$GS_USER'")" != "1" ]; then
+        echo "[init-db] l'utente $GS_USER non esiste e GS_DB_PASSWORD è vuota: non posso crearlo" >&2
+        exit 2
+      fi
+      echo "[init-db] utente $GS_USER già presente, password non toccata (GS_DB_PASSWORD vuota)"
+    fi
+
+    # PostGIS: il datastore di GeoServer lo vuole nel database (best effort: serve un utente che possa creare estensioni)
+    if [ "${POSTGIS_EXTENSION:-true}" = "true" ]; then
+      psql_admin -d "$DB" -qc "CREATE EXTENSION IF NOT EXISTS postgis" >/dev/null 2>&1 \
+        && echo "[init-db] estensione postgis presente" \
+        || echo "[init-db] postgis non creata (permessi o estensione assente): se serve, abilitala con un superuser"
+    fi
+
+    echo "[init-db] applico lo schema $SCHEMA su $DB (utente applicativo: ${GS_USER:-nessuno})"
+    psql_admin -d "$DB" -v ON_ERROR_STOP=1 -v schema="$SCHEMA" -v gs_user="$GS_USER" -f /scripts/mapp-config.sql
+    echo "[init-db] fatto"
+
+  publish-geoserver.sh: |
+    #!/bin/sh
+    # Passo 2: pubblica in GeoServer workspace, datastore e i layer (role_rules, dashboards, saved_views) via REST.
+    # Idempotente: ciò che esiste già non viene toccato. Disattivabile con PUBLISH_GEOSERVER=false.
+    set -eu
+
+    [ "${PUBLISH_GEOSERVER:-true}" = "true" ] || { echo "[geoserver] pubblicazione disattivata (PUBLISH_GEOSERVER=false)"; exit 0; }
+
+    GS="${GEOSERVER_URL:?GEOSERVER_URL mancante (es. http://geoserver:8080/geoserver)}"
+    GS="${GS%/}"
+    : "${GEOSERVER_USER:?GEOSERVER_USER mancante}" "${GEOSERVER_PASSWORD:?GEOSERVER_PASSWORD mancante}"
+    WS="${CONFIG_WORKSPACE:-gema}"
+    DS="${DATASTORE:-gema_config}"
+    DB="${MAPP_DB:-gema_config}"
+    SCHEMA="${MAPP_SCHEMA:-gema_config}"
+    DBHOST="${DS_DB_HOST:-${PGHOST:?PGHOST mancante}}"
+    DBPORT="${DS_DB_PORT:-${PGPORT:-5432}}"
+    # il datastore usa SEMPRE l'utente applicativo (mai l'amministratore del database)
+    DBUSER="${GS_DB_USER:-${PGUSER:?GS_DB_USER o PGUSER mancante}}"
+    DBPASS="${GS_DB_PASSWORD:-${PGPASSWORD:?GS_DB_PASSWORD o PGPASSWORD mancante}}"
+    TABLES="role_rules dashboards saved_views"
+    UPDATE_DS="${UPDATE_DATASTORE:-false}"
+    TMP="${TMPDIR:-/tmp}"
+
+    for v in "$WS" "$DS" "$DB" "$SCHEMA"; do
+      case "$v" in
+        ""|*[!A-Za-z0-9_-]*) echo "[geoserver] nome non valido: '$v'" >&2; exit 2 ;;
+      esac
+    done
+
+    # escape per i valori messi tra virgolette in JSON / file di configurazione di curl
+    jesc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+    # credenziali in un file (non nella riga di comando)
+    umask 077
+    printf 'user = "%s:%s"\n' "$(jesc "$GEOSERVER_USER")" "$(jesc "$GEOSERVER_PASSWORD")" > "$TMP/gs.curlrc"
+
+    # api METODO PERCORSO [JSON]  ->  stampa lo status HTTP, corpo in $TMP/body
+    api() {
+      m=$1; p=$2; d=${3:-}
+      if [ -n "$d" ]; then
+        curl -sS -K "$TMP/gs.curlrc" -o "$TMP/body" -w '%{http_code}' --max-time 30 -X "$m" -H 'Content-Type: application/json' -H 'Accept: application/json' -d "$d" "$GS$p" || true
+      else
+        curl -sS -K "$TMP/gs.curlrc" -o "$TMP/body" -w '%{http_code}' --max-time 30 -X "$m" -H 'Accept: application/json' "$GS$p" || true
+      fi
+    }
+    die() { echo "[geoserver] $1" >&2; if [ -s "$TMP/body" ]; then echo "[geoserver] risposta di GeoServer:" >&2; head -c 2500 "$TMP/body" >&2; echo >&2; fi; exit 1; }
+    # valore di un parametro di connessione dal JSON del datastore (corpo in $TMP/body)
+    dsparam() { tr '{}' '\n\n' < "$TMP/body" | grep "\"@key\":\"$1\"" | head -n 1 | sed 's/.*"\$":"\([^"]*\)".*/\1/'; }
+    # JSON del datastore con i parametri voluti
+    ds_body() {
+      printf '{"dataStore":{"name":"%s","type":"PostGIS","enabled":true,"connectionParameters":{"entry":[{"@key":"dbtype","$":"postgis"},{"@key":"host","$":"%s"},{"@key":"port","$":"%s"},{"@key":"database","$":"%s"},{"@key":"schema","$":"%s"},{"@key":"user","$":"%s"},{"@key":"passwd","$":"%s"},{"@key":"Expose primary keys","$":"false"},{"@key":"validate connections","$":"true"}]}}}' \
+        "$DS" "$(jesc "$DBHOST")" "$DBPORT" "$(jesc "$DB")" "$SCHEMA" "$(jesc "$DBUSER")" "$(jesc "$DBPASS")"
+    }
+
+    echo "[geoserver] attendo $GS ..."
+    i=0
+    while :; do
+      s=$(api GET /rest/about/version.json)
+      [ "$s" = "200" ] && break
+      [ "$s" = "401" ] && die "credenziali GeoServer rifiutate (HTTP 401): controlla GEOSERVER_USER/PASSWORD e che /rest accetti l'autenticazione basic"
+      i=$((i + 1)); [ "$i" -le "${WAIT_TRIES:-60}" ] || die "GeoServer non risponde (ultimo status $s)"
+      sleep 5
+    done
+
+    # --- workspace
+    s=$(api GET "/rest/workspaces/$WS.json")
+    if [ "$s" = "404" ]; then
+      s=$(api POST /rest/workspaces "{\"workspace\":{\"name\":\"$WS\"}}")
+      [ "$s" = "201" ] || die "creazione workspace $WS fallita (HTTP $s)"
+      echo "[geoserver] workspace $WS creato"
+    elif [ "$s" = "200" ]; then echo "[geoserver] workspace $WS già presente"
+    else die "lettura workspace $WS fallita (HTTP $s)"; fi
+
+    # --- datastore PostGIS. Se esiste, i parametri si confrontano con quelli voluti (UPDATE_DATASTORE=true li allinea)
+    s=$(api GET "/rest/workspaces/$WS/datastores/$DS.json")
+    if [ "$s" = "404" ]; then
+      s=$(api POST "/rest/workspaces/$WS/datastores" "$(ds_body)")
+      [ "$s" = "201" ] || die "creazione datastore $DS fallita (HTTP $s)"
+      echo "[geoserver] datastore $DS creato (db=$DB schema=$SCHEMA utente=$DBUSER)"
+    elif [ "$s" = "200" ]; then
+      diff=""
+      for pair in "host:$DBHOST" "port:$DBPORT" "database:$DB" "schema:$SCHEMA" "user:$DBUSER"; do
+        k=${pair%%:*}; want=${pair#*:}; cur=$(dsparam "$k")
+        [ "$cur" = "$want" ] || diff="$diff $k(attuale='$cur' voluto='$want')"
+      done
+      if [ -z "$diff" ]; then
+        echo "[geoserver] datastore $DS già presente e allineato (db=$DB schema=$SCHEMA utente=$DBUSER)"
+      elif [ "$UPDATE_DS" = "true" ]; then
+        s=$(api PUT "/rest/workspaces/$WS/datastores/$DS" "$(ds_body)")
+        [ "$s" = "200" ] || die "aggiornamento del datastore $DS fallito (HTTP $s)"
+        echo "[geoserver] datastore $DS aggiornato, differenze corrette:$diff"
+      else
+        echo "[geoserver] ATTENZIONE: il datastore $DS esiste con parametri diversi da quelli del Job:$diff" >&2
+        echo "[geoserver]   per allinearlo imposta UPDATE_DATASTORE=true (la password non è confrontabile e viene riscritta)" >&2
+      fi
+    else die "lettura datastore $DS fallita (HTTP $s)"; fi
+
+    # --- layer (tabelle senza geometria: saranno disponibili solo in WFS)
+    for t in $TABLES; do
+      s=$(api GET "/rest/workspaces/$WS/datastores/$DS/featuretypes/$t.json")
+      if [ "$s" = "404" ]; then
+        # il datastore deve vedere la tabella: se non la vede, l'errore vero è qui (connessione, schema o permessi)
+        s=$(api GET "/rest/workspaces/$WS/datastores/$DS/featuretypes.json?list=available")
+        [ "$s" = "200" ] || die "il datastore $DS non riesce a leggere il database (HTTP $s): controlla utente/password, host e rete verso PostgreSQL, e il log di GeoServer"
+        case "$(cat "$TMP/body")" in
+          *"\"$t\""*) ;;
+          *) echo "[geoserver] tabelle che il datastore $DS vede in $SCHEMA: $(cat "$TMP/body")" >&2
+             die "la tabella $t non è visibile dal datastore $DS: schema sbagliato ($SCHEMA?), tabella non creata dal passo SQL o utente $DBUSER senza permessi" ;;
+        esac
+        s=$(api POST "/rest/workspaces/$WS/datastores/$DS/featuretypes" "{\"featureType\":{\"name\":\"$t\",\"nativeName\":\"$t\",\"title\":\"$t\",\"enabled\":true}}")
+        [ "$s" = "201" ] || die "pubblicazione di $WS:$t fallita (HTTP $s)"
+        echo "[geoserver] layer $WS:$t pubblicato"
+      elif [ "$s" = "200" ]; then echo "[geoserver] layer $WS:$t già pubblicato"
+      else die "lettura del layer $WS:$t fallita (HTTP $s)"; fi
+    done
+
+    # --- regole dati (opzionale): ruoli e dashboard si leggono dai ruoli applicativi e si scrivono solo dall'admin;
+    #     le viste salvate le scrive chiunque abbia un ruolo applicativo (ognuno salva le proprie)
+    if [ "${SET_ACL:-false}" = "true" ]; then
+      READ="${ACL_READ_ROLES:?ACL_READ_ROLES mancante (es. ROLE_FSS-ETL-VIEWER,ROLE_FSS-ETL-ADMIN)}"
+      WRITE="${ACL_WRITE_ROLES:?ACL_WRITE_ROLES mancante (es. ROLE_FSS-ETL-ADMIN)}"
+      VIEWS_WRITE="${ACL_VIEWS_WRITE_ROLES:-$READ}"
+      api GET /rest/security/acl/layers >/dev/null
+      cp "$TMP/body" "$TMP/acl.json"
+      acl() { # $1 = layer, $2 = r|w, $3 = ruoli
+        key="$WS.$1.$2"
+        rule="{\"$key\":\"$(jesc "$3")\"}"
+        if grep -q "\"$key\"" "$TMP/acl.json"; then s=$(api PUT /rest/security/acl/layers "$rule"); else s=$(api POST /rest/security/acl/layers "$rule"); fi
+        case "$s" in 200|201) echo "[geoserver] regola $key = $3" ;; *) die "regola $key non applicata (HTTP $s)" ;; esac
+      }
+      for t in role_rules dashboards; do acl "$t" r "$READ"; acl "$t" w "$WRITE"; done
+      acl saved_views r "$READ"
+      acl saved_views w "$VIEWS_WRITE"
+    else
+      echo "[geoserver] regole dati non toccate (SET_ACL=false): ricordati di limitare la scrittura su $WS:role_rules e $WS:dashboards al ruolo admin (e quella su $WS:saved_views ai ruoli applicativi)"
+    fi
+
+    # --- verifica finale: lo schema deve essere leggibile via WFS come lo legge l'app
+    for t in $TABLES; do
+      s=$(curl -sS -K "$TMP/gs.curlrc" -o "$TMP/body" -w '%{http_code}' --max-time 30 "$GS/ows?service=WFS&version=1.0.0&request=DescribeFeatureType&typeName=$WS:$t" || echo 000)
+      [ "$s" = "200" ] && grep -q 'name="' "$TMP/body" && ! grep -q 'ServiceException' "$TMP/body" || die "$WS:$t non risponde in WFS (HTTP $s)"
+      echo "[geoserver] verifica WFS $WS:$t ok"
+    done
+    rm -f "$TMP/gs.curlrc"
+    echo "[geoserver] fatto"

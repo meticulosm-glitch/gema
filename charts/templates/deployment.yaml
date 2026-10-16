@@ -1,0 +1,121 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "geolibre.fullname" . }}
+  labels:
+    {{- include "geolibre.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "geolibre.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "geolibre.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: geolibre
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 80
+          {{- $envVars := dict }}
+          {{- range .Values.env }}
+            {{- $_ := set $envVars .name . }}
+          {{- end }}
+          {{- range .Values.extraEnv }}
+            {{- $_ := set $envVars .name . }}
+          {{- end }}
+          {{- if $envVars }}
+          env:
+            {{- values $envVars | toYaml | nindent 12 }}
+          {{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.eso.existingSecret }}
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+        {{- if .Values.auth.enabled }}
+        - name: oauth2-proxy
+          image: {{ .Values.auth.image }}
+          args:
+            - --provider=keycloak-oidc
+            - --oidc-issuer-url={{ .Values.auth.issuerUrl }}
+            - --client-id={{ .Values.auth.clientId }}
+            - --allowed-role={{ .Values.auth.clientId }}:{{ .Values.auth.clientRole }}
+            - --redirect-url={{ .Values.apisixRoute.host }}/oauth2/callback
+            - --upstream=http://127.0.0.1:80
+            - --http-address=0.0.0.0:4180
+            - --email-domain=*
+            - --scope=openid email profile
+            - --reverse-proxy=true
+            - --skip-provider-button=true
+            - --cookie-secure=true
+            - --cookie-samesite=lax
+            - --cookie-refresh=4m
+            - --cookie-expire=8h
+          env:
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret }}
+                  key: OIDC_CLIENT_SECRET
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret }}
+                  key: OAUTH2_PROXY_COOKIE_SECRET
+          ports:
+            - name: auth
+              containerPort: 4180
+          readinessProbe:
+            httpGet: { path: /ping, port: 4180 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /ping, port: 4180 }
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.auth.resources | nindent 12 }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+        {{- end }}
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

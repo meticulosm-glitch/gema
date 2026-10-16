@@ -1,0 +1,8 @@
+{
+  "keycloak": { "url": "http://localhost:8081", "realm": "master", "clientId": "mapp-web" },
+  "apiUrl": "/api",
+  "geoserverUrl": "http://localhost:8080/geoserver",
+  "basemapTiles": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+  "mapCenter": [12.5, 42.0],
+  "mapZoom": 5
+}

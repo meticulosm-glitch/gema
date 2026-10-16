@@ -1,0 +1,204 @@
+# Inizializza la configurazione di mapp-web (ruoli, dashboard e viste salvate) a ogni sync di ArgoCD, in modo idempotente:
+#   1) initContainer "init-db": con l'utenza di amministrazione crea (se serve) database, tabelle e utente applicativo in PostgreSQL
+#   2) container "publish-geoserver": crea workspace, datastore e i layer role_rules / dashboards / saved_views in GeoServer
+# Al primo avvio fa tutto; dai sync successivi riconosce che c'è già tutto e termina subito.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mapp-config-init
+  labels:
+    app.kubernetes.io/name: mapp-web
+    app.kubernetes.io/component: config-init
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation   # il Job precedente viene rimosso prima di crearne uno nuovo
+    argocd.argoproj.io/sync-wave: "1"                           # dopo la ConfigMap
+spec:
+  backoffLimit: 6                 # GeoServer o PostgreSQL potrebbero non essere ancora pronti
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mapp-web
+        app.kubernetes.io/component: config-init
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: init-db
+          image: docker.io/library/postgres:17-alpine
+          command:
+            - /scripts/init-db.sh
+          env:
+            - name: HOME
+              value: /tmp
+            - name: PGHOST
+              value: {{ .Values.postgres.host }}
+            - name: PGPORT
+              valueFrom:
+                secretKeyRef:
+                  name: mapp-config-db
+                  key: port
+                  optional: true
+            # utenza di AMMINISTRAZIONE: serve solo a questo passo (CREATE DATABASE, tabelle, ruolo applicativo)
+            - name: PG_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mapp-config-db
+                  key: PG_ADMIN_USER
+            - name: PG_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mapp-config-db
+                  key: PG_ADMIN_PASSWORD
+            # utenza APPLICATIVA (datastore GeoServer): viene creata se manca e riceve solo i diritti sulle tabelle
+            - name: GS_DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mapp-config-db
+                  key: gs_user
+                  optional: true
+            - name: GS_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mapp-config-db
+                  key: gs_password
+                  optional: true
+            - name: MAPP_DB
+              value: gema_config
+            - name: MAPP_SCHEMA
+              value: gema_config
+            - name: DB_CREATE
+              value: "true"        # "false" se il database esiste già (l'admin deve poter fare CREATE DATABASE)
+            - name: POSTGIS_EXTENSION
+              value: "true"        # CREATE EXTENSION postgis nel database (best effort)
+          securityContext:
+            runAsUser: 70                    # utente "postgres" dell'immagine alpine
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: publish-geoserver
+          image: docker.io/curlimages/curl:8.11.1
+          command:
+            - /scripts/publish-geoserver.sh
+          env:
+            - name: HOME
+              value: /tmp
+            - name: TMPDIR
+              value: /tmp
+            - name: PUBLISH_GEOSERVER
+              value: "true"
+            - name: UPDATE_DATASTORE
+              value: "true"                    # allinea un datastore già esistente (db, schema, utente, password)
+            - name: GEOSERVER_URL
+              value: "http://mapp-enterprise-lot1-geoserver/geoserver"
+            - name: GEOSERVER_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mapp-config-geoserver
+                  key: user
+            - name: GEOSERVER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mapp-config-geoserver
+                  key: password
+            - name: CONFIG_WORKSPACE
+              value: {{ include "gema.configWorkspace" . | quote }}
+            - name: DATASTORE
+              value: gema_config
+            - name: MAPP_DB
+              value: gema_config
+            - name: MAPP_SCHEMA
+              value: gema_config
+            # connessione che GeoServer userà per leggere le tabelle: SOLO l'utenza applicativa
+            - name: PGHOST
+              value: {{ .Values.postgres.host }}
+            - name: PGPORT
+              valueFrom:
+                secretKeyRef:
+                  name: mapp-config-db
+                  key: port
+                  optional: true
+            - name: GS_DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mapp-config-db
+                  key: gs_user
+                  optional: true
+            - name: GS_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mapp-config-db
+                  key: gs_password
+                  optional: true
+            # fallback (se GS_DB_* non sono presenti nel secret)
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: mapp-config-db
+                  key: user
+                  optional: true
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mapp-config-db
+                  key: password
+                  optional: true
+            # regole dati di GeoServer
+            - name: SET_ACL
+              value: "true"
+            - name: ACL_READ_ROLES
+              value: "ROLE_FSS-ETL-VIEWER,ROLE_FSS-ETL-ADMIN"
+            - name: ACL_WRITE_ROLES
+              value: "ROLE_FSS-ETL-ADMIN"       # scrittura su role_rules e dashboards
+            # - name: ACL_VIEWS_WRITE_ROLES
+            #   value: "ROLE_FSS-ETL-VIEWER,ROLE_FSS-ETL-ADMIN"   # scrittura su saved_views (default = ACL_READ_ROLES)
+          securityContext:
+            runAsUser: 100                   # curl_user
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: scripts
+          configMap:
+            name: mapp-config-init
+            defaultMode: 0555
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Mi

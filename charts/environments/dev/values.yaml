@@ -1,0 +1,7 @@
+environment: dev
+apisixRoute: 
+  host: gema.example.it
+
+extraEnv: 
+  - name: KEYCLOAK_URL
+    value: https://auth.example.it
