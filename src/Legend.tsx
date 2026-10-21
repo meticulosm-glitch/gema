@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import type Keycloak from "keycloak-js";
 import { fetchLegendBlob } from "./api";
 
-export interface LegendEntry { key: string; layer: string; title: string; style?: string; tag?: string }
+export interface LegendEntry { key: string; layer: string; title: string; style?: string; tag?: string; swatch?: string } // swatch: colore del disegno vettoriale
 
 /** Legenda di un layer nello stile scelto (GetLegendGraphic). Si ricarica quando cambia lo stile. */
 export default function Legend({ gsUrl, kc, layer, style }: { gsUrl: string; kc: Keycloak | null; layer: string; style?: string }) {
@@ -39,7 +39,9 @@ export function LegendPanel({ gsUrl, kc, entries }: { gsUrl: string; kc: Keycloa
           {entries.map((e) => (
             <section key={e.key} className="lp-item">
               <div className="lp-title" title={e.layer}>{e.tag && <span className="chip">{e.tag}</span>} {e.title}</div>
-              <Legend gsUrl={gsUrl} kc={kc} layer={e.layer} style={e.style} />
+              {e.swatch
+                ? <div className="lp-swatch"><span style={{ background: e.swatch }} aria-hidden="true" /> disegno vettoriale</div>
+                : <Legend gsUrl={gsUrl} kc={kc} layer={e.layer} style={e.style} />}
             </section>
           ))}
         </div>

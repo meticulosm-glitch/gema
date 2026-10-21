@@ -23,4 +23,10 @@ export const IconSeries = () => <Svg size={18}><path d="M3 20h18M3 20V4" /><path
 export const IconCompare = () => <Svg size={18}><rect x="3" y="4" width="18" height="16" rx="1" /><path d="M12 4v16M8 10l-2 2 2 2M16 10l2 2-2 2" /></Svg>;
 export const IconSearch = () => <Svg><circle cx="11" cy="11" r="7" /><path d="M21 21l-4.3-4.3" /></Svg>;
 export const IconBookmark = () => <Svg size={18}><path d="M6 3h12v18l-6-4-6 4z" /></Svg>;
+export const IconDownload = () => <Svg><path d="M12 4v11M7 10l5 5 5-5M5 20h14" /></Svg>;
 export const IconDoc = () => <Svg><path d="M6 3h9l4 4v14H6z" /><path d="M14 3v5h5M9 13h6M9 17h6" /></Svg>;
+export const IconFolder = () => <Svg><path d="M3 6.5A1.5 1.5 0 014.5 5H9l2 2.5h8.5A1.5 1.5 0 0121 9v9.5a1.5 1.5 0 01-1.5 1.5h-15A1.5 1.5 0 013 18.5z" /></Svg>;
+export const IconLayers = () => <Svg><path d="M12 3l9 5-9 5-9-5z" /><path d="M3 13l9 5 9-5" /></Svg>;
+export const IconUp = () => <Svg><path d="M12 19V5M6 11l6-6 6 6" /></Svg>;
+export const IconDown = () => <Svg><path d="M12 5v14M6 13l6 6 6-6" /></Svg>;
+export const IconGrip = () => <Svg><path d="M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01" /></Svg>;

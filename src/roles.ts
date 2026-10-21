@@ -1,7 +1,7 @@
 import type Keycloak from "keycloak-js";
 import type { AccessConfig } from "./config";
 
-export type ToolId = "info" | "measure" | "table" | "dashboard" | "export" | "edit" | "view3d" | "series" | "compare" | "search" | "views";
+export type ToolId = "info" | "measure" | "table" | "dashboard" | "export" | "edit" | "view3d" | "series" | "compare" | "search" | "views" | "download";
 
 export const TOOLS: { id: ToolId; label: string; hint: string }[] = [
   { id: "info", label: "Interroga oggetti", hint: "Feature Info" },
@@ -14,11 +14,12 @@ export const TOOLS: { id: ToolId; label: string; hint: string }[] = [
   { id: "compare", label: "Confronto con cursore", hint: "swipe tra due layer o due date" },
   { id: "search", label: "Ricerca luoghi e attributi", hint: "indirizzi (geocoder) e testo negli attributi dei layer attivi" },
   { id: "views", label: "Viste salvate", hint: "salva e riapri viste con nome (tabella saved_views)" },
+  { id: "download", label: "Scarica dati", hint: "CSV, GeoJSON, Shapefile (WFS) e GeoTIFF dell'area visibile (WCS)" },
   { id: "edit", label: "Modifica oggetti", hint: "WFS-T: serve anche il permesso di scrittura su GeoServer" },
 ];
 export const TOOL_IDS = TOOLS.map((t) => t.id);
 /** Strumenti del visualizzatore finché l'admin non ha configurato nessuna regola. */
-export const DEFAULT_VIEWER_TOOLS: ToolId[] = ["info", "measure", "table", "dashboard", "export", "view3d", "series", "compare", "search", "views"];
+export const DEFAULT_VIEWER_TOOLS: ToolId[] = ["info", "measure", "table", "dashboard", "export", "view3d", "series", "compare", "search", "views", "download"];
 
 export interface RoleRule { fid?: string; role: string; layers: string[]; tools: ToolId[]; updatedBy?: string; updatedAt?: string }
 

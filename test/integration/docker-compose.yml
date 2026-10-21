@@ -1,0 +1,28 @@
+# Servizi reali per i test di integrazione (npm run test:integration:docker).
+# Le porte sull'host si cambiano con INT_PGPORT e INT_GSPORT se 55432 / 58080 sono occupate.
+services:
+  postgis:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_PASSWORD: pgadmin
+    ports:
+      - "127.0.0.1:${INT_PGPORT:-55432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+  geoserver:
+    image: docker.osgeo.org/geoserver:2.26.2
+    environment:
+      SKIP_DEMO_DATA: "true"
+    ports:
+      - "127.0.0.1:${INT_GSPORT:-58080}:8080"
+    depends_on:
+      postgis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsu admin:geoserver http://localhost:8080/geoserver/rest/about/version.json >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 60

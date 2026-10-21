@@ -8,6 +8,10 @@ import {
   buildDelete, buildGeometry, buildInsert, buildUpdate, kindFor, minPoints, type Geom, type Kind,
 } from "./edit";
 import { attachVertexEditor, renderDraft, renderEdit } from "./vertexEditor";
+import type { AccessConfig } from "./config";
+import { loadEditForm } from "./configStore";
+import { newValues, resolveForm, validateValues, type FormDef } from "./editForm";
+import EditFields from "./EditFields";
 import type { LngLat } from "./geo";
 import { IconClose } from "./icons";
 
@@ -20,7 +24,6 @@ interface Session {
   geomDirty: boolean;
 }
 
-const NUMERIC = ["int", "integer", "long", "short", "byte", "double", "float", "decimal"];
 const str = (v: unknown) => (v === null || v === undefined ? "" : typeof v === "object" ? JSON.stringify(v) : String(v));
 const label = (f: Feature) => {
   const first = Object.values(f.properties ?? {}).find((v) => typeof v === "string" && v);
@@ -32,7 +35,7 @@ const label = (f: Feature) => {
  * crea un nuovo oggetto, elimina. I permessi veri li applica GeoServer: qui si mostra solo l'esito.
  */
 export default function Editor({
-  map, gsUrl, kc, layer, title, params, initial, onClose, onSaved,
+  map, gsUrl, kc, layer, title, params, initial, access, onClose, onSaved,
 }: {
   map: maplibregl.Map;
   gsUrl: string;
@@ -41,6 +44,7 @@ export default function Editor({
   title: string;
   params: LayerParams;               // filtro/tempo attivi del layer, usati per scegliere gli oggetti sulla mappa
   initial?: Feature;                 // oggetto da aprire subito (da Feature Info o dalla tabella)
+  access?: AccessConfig;             // con il controllo accessi: modulo configurato del layer (tabella edit_forms)
   onClose: () => void;
   onSaved: () => void;               // chiamata dopo ogni scrittura riuscita (ricarica tile/tabella)
 }) {
@@ -52,9 +56,12 @@ export default function Editor({
   const [session, setSession] = useState<Session | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [form, setForm] = useState<FormDef | null>(null);
+  const [errors, setErrors] = useState<Record<string, string>>({});
 
   const geomRef = useRef<Geom | null>(null);
   const schemaRef = useRef<Schema | null>(null); schemaRef.current = schema;
+  const formRef = useRef<FormDef | null>(null); formRef.current = form;
   const paramsRef = useRef(params); paramsRef.current = params;
   const initialRef = useRef(initial);
 
@@ -79,6 +86,7 @@ export default function Editor({
       highlightOff();
       renderEdit(map, geomRef.current);
       setSession({ id: src.id ?? f.id, values, original: { ...values }, geomDirty: false });
+      setErrors({});
       setCandidates([]); setStage("form");
     } catch (e: any) {
       setMsg({ ok: false, text: `Impossibile aprire l'oggetto: ${e.message}` });
@@ -87,19 +95,23 @@ export default function Editor({
     }
   }, [gsUrl, kc, layer, map]);
 
-  // schema del layer (fallisce per i raster)
+  // schema del layer (fallisce per i raster) e modulo configurato (se non si legge: campi predefiniti)
   useEffect(() => {
     let cancelled = false;
-    describeLayer(gsUrl, kc, layer)
-      .then((s) => {
+    const formP = access
+      ? loadEditForm(gsUrl, kc, access, layer).catch((e) => { console.warn("[mapp] modulo di modifica non disponibile:", e?.message ?? e); return null; })
+      : Promise.resolve(null);
+    Promise.all([describeLayer(gsUrl, kc, layer), formP])
+      .then(([s, f]) => {
         if (cancelled) return;
+        setForm(f);
         setSchema(s);
         setKind(kindFor(s.geomType));
         if (initialRef.current) void openFeature(initialRef.current);
       })
       .catch((e) => !cancelled && setMsg({ ok: false, text: `Questo layer non è modificabile: ${e.message}` }));
     return () => { cancelled = true; };
-  }, [gsUrl, kc, layer, openFeature]);
+  }, [gsUrl, kc, layer, openFeature, access]);
 
   // clic sulla mappa: scelta dell'oggetto (pick) o nuovo vertice (draw)
   useEffect(() => {
@@ -164,9 +176,8 @@ export default function Editor({
     const g = buildGeometry(kind, pts, s.geomType);
     geomRef.current = g;
     renderEdit(map, g);
-    const values: Record<string, string> = {};
-    for (const f of s.fields) values[f.name] = "";
-    setSession({ values, original: {}, geomDirty: true });
+    setSession({ values: newValues(resolveForm(s.fields, formRef.current)), original: {}, geomDirty: true });
+    setErrors({});
     setStage("form");
   };
 
@@ -184,15 +195,23 @@ export default function Editor({
     }
   };
 
+  const fields = schema ? resolveForm(schema.fields, form) : [];
   const save = () => {
     if (!schema || !session || !geomRef.current) return;
+    const errs = validateValues(fields, session.values, !session.id);
+    setErrors(errs);
+    if (Object.keys(errs).length > 0) {
+      setMsg({ ok: false, text: `Controlla i campi evidenziati (${Object.keys(errs).length}).` });
+      return;
+    }
     if (!session.id) {
       const values = Object.fromEntries(Object.entries(session.values).filter(([, v]) => v !== ""));
       void send(buildInsert(schema, values, geomRef.current), "Nuovo oggetto creato.");
       return;
     }
     const changes: Record<string, string | null> = {};
-    for (const f of schema.fields) {
+    for (const f of fields) {
+      if (f.readonly || f.hidden) continue; // non modificabili dall'utente: non si riscrivono
       const now = session.values[f.name] ?? "";
       if (now !== (session.original[f.name] ?? "")) changes[f.name] = now === "" ? null : now;
     }
@@ -279,32 +298,17 @@ export default function Editor({
               {session.id ? `Oggetto ${session.id}` : "Nuovo oggetto"} — trascina i vertici per spostarli, trascina i punti chiari per aggiungerne, tasto destro su un vertice per eliminarlo.
               {session.geomDirty && <strong> Geometria modificata.</strong>}
             </div>
-            <div className="ed-form">
-              {schema.fields.map((f) => {
-                const t = f.type.toLowerCase();
-                const v = session.values[f.name] ?? "";
-                const set = (val: string) => setSession((s) => (s ? { ...s, values: { ...s.values, [f.name]: val } } : s));
-                return (
-                  <label key={f.name} className="ed-field">
-                    <span title={`${f.name} (${f.type})`}>{f.name}</span>
-                    {t === "boolean" ? (
-                      <select value={v} onChange={(e) => set(e.target.value)}>
-                        <option value=""></option><option value="true">true</option><option value="false">false</option>
-                      </select>
-                    ) : (
-                      <input
-                        className="search"
-                        type={NUMERIC.includes(t) ? "number" : "text"}
-                        step={NUMERIC.includes(t) ? "any" : undefined}
-                        placeholder={t.startsWith("date") ? "AAAA-MM-GG" + (t === "datetime" ? "THH:MM:SSZ" : "") : ""}
-                        value={v}
-                        onChange={(e) => set(e.target.value)}
-                      />
-                    )}
-                  </label>
-                );
-              })}
-            </div>
+            <EditFields
+              fields={fields}
+              values={session.values}
+              errors={errors}
+              isNew={!session.id}
+              onChange={(name, val) => {
+                setSession((x) => (x ? { ...x, values: { ...x.values, [name]: val } } : x));
+                setMsg(null);
+                setErrors((e) => { if (!(name in e)) return e; const { [name]: _drop, ...rest } = e; return rest; });
+              }}
+            />
             <div className="ed-pad ed-row">
               <button className="btn-sm primary" disabled={busy} onClick={save}>Salva</button>
               {session.id && <button className="btn-sm danger" disabled={busy} onClick={remove}>Elimina</button>}

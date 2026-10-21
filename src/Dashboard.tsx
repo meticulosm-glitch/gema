@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type * as maplibregl from "maplibre-gl";
 import type Keycloak from "keycloak-js";
-import { describeLayer, getWfsFeatures, type Schema } from "./api";
+import { describeLayer, getWfsCount, getWfsFeatures, type Schema } from "./api";
 
 /** Selezione fatta cliccando un grafico: diventa un filtro CQL sul layer (mappa e tabella). */
 export interface DashSel { field: string; cql: string; label: string; key: string }
@@ -163,6 +163,7 @@ export default function Dashboard({
   const [viewTick, setViewTick] = useState(0);
   const [values, setValues] = useState<unknown[]>([]);
   const [capped, setCapped] = useState(false);
+  const [serverTotal, setServerTotal] = useState<number | null>(null); // oggetti in tutto quando i dati sono troncati
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<"chart" | "table">("chart");
@@ -206,6 +207,9 @@ export default function Dashboard({
         if (cancelled) return;
         setValues(fs.map((f) => f.properties?.[field]));
         setCapped(fs.length >= MAX_FEATURES);
+        setServerTotal(null);
+        // troncato: quanti sono in tutto lo dice GeoServer (resultType=hits), senza scaricarli
+        if (fs.length >= MAX_FEATURES) getWfsCount(gsUrl, kc, layer, filter).then((n) => { if (!cancelled) setServerTotal(n); }, () => {});
       })
       .catch((e) => { if (!cancelled) { setValues([]); setError(`Dati non disponibili: ${e.message}`); } })
       .finally(() => { if (!cancelled) setLoading(false); });
@@ -307,7 +311,7 @@ export default function Dashboard({
             <button className="icon-btn" title="Rimuovi la selezione" onClick={() => onSelect(null)}>×</button>
           </span>
         )}
-        <span className="dock-count">{loading ? "aggiornamento…" : capped ? `primi ${MAX_FEATURES} oggetti` : ""}</span>
+        <span className="dock-count">{loading ? "aggiornamento…" : capped ? (serverTotal ? `primi ${MAX_FEATURES.toLocaleString("it-IT")} di ${serverTotal.toLocaleString("it-IT")} oggetti` : `primi ${MAX_FEATURES} oggetti`) : ""}</span>
       </div>
       <div className={`dock-scroll dash${stale ? " stale" : ""}`}>
         {error && <div className="error">{error}</div>}

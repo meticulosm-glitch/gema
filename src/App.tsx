@@ -6,8 +6,11 @@ import type Keycloak from "keycloak-js";
 import type { AppConfig } from "./config";
 import { describeLayer, fetchLegendBlob, getFeatureInfo, getWfsFeatures, wmsTileUrl, type Feature, type LayerParams } from "./api";
 import { AoiControl, goToAoi } from "./aoiControl";
-import { isConfigLayer } from "./configStore";
+import type { StartView } from "./roleView";
+import { isConfigLayer, loadCatalog } from "./configStore";
+import { EMPTY_CATALOG, applyCatalog, buildTree, countLayers, defaultOnLayers, filterTree, flattenLayers, isEmptyCatalog, type Catalog, type CatalogNode } from "./catalog";
 import { parseCapabilities, fetchVectorNames, markVector, type Product } from "./capabilities";
+import DownloadPanel from "./DownloadPanel";
 import { bboxOf, type LngLat } from "./geo";
 import { exportMapPng, type LegendItem } from "./exportPng";
 import AttributeTable from "./AttributeTable";
@@ -20,6 +23,8 @@ import SeriesPanel, { type SeriesCandidate } from "./SeriesPanel";
 import { shortTime, stepIndex, timeSteps } from "./timeline";
 import { InfoPanel, MeasurePanel, type InfoState } from "./panels";
 import SearchBox from "./SearchBox";
+import { track } from "./usage";
+import { addVectorLayer, hoverLabel, identityFilter, removeVectorLayer, setVectorHover, setVectorOpacity, setVectorTiles, setVectorVisible, supportsMvt, vtColor, vtLayerIds, vtTileUrl } from "./vectorTiles";
 import BasemapSwitcher from "./BasemapSwitcher";
 import LayerInfoPanel from "./LayerInfoPanel";
 import ViewsPanel from "./ViewsPanel";
@@ -31,11 +36,13 @@ import { addEditLayers } from "./vertexEditor";
 import { Brand, PartnerLogos } from "./branding";
 import { layerAllowed, type Permissions, type ToolId } from "./roles";
 import {
-  IconArea, IconBookmark, IconChart, IconClose, IconCompare, IconCube, IconDoc, IconEdit, IconInfo, IconLink, IconMenu, IconPan, IconPin, IconPrint, IconRuler, IconSeries, IconTable, IconZoom,
+  IconArea, IconBookmark, IconChart, IconClose, IconCompare, IconCube, IconDoc, IconDownload, IconEdit, IconInfo, IconLink, IconMenu, IconPan, IconPin, IconPrint, IconRuler, IconSeries, IconTable, IconZoom,
 } from "./icons";
 
 type Tool = "pan" | "info" | "series" | "coord" | "length" | "area";
-interface LayerState { opacity: number; cql: string; time: string; style: string }
+interface LayerState { opacity: number; cql: string; time: string; style: string; vt?: boolean } // vt: disegno vettoriale (vector tiles)
+/** Colore del disegno vettoriale: stabile per layer (non cambia se se ne accendono altri). */
+const vtColorOf = (name: string) => vtColor(Array.from(name).reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7));
 type Dock = { layer: string; tab: "table" | "dash" } | null;
 // `n` cambia a ogni richiesta di apertura: l'editor si rimonta anche se layer e oggetto sono gli stessi
 type Editing = { layer: string; initial?: Feature; n: number } | null;
@@ -53,7 +60,10 @@ const andJoin = (...parts: (string | undefined)[]) => {
 // ---------------------------------------------------------------- stato nel link (#s=…): vista, layer attivi e sfondo (vedi viewState.ts)
 const readHash = () => parseHash(window.location.hash);
 
-export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppConfig; kc: Keycloak | null; perms?: Permissions | null; nav?: ReactNode }) {
+export default function App({ cfg, kc, perms = null, nav = null, startView = null, banner = null }: {
+  cfg: AppConfig; kc: Keycloak | null; perms?: Permissions | null; nav?: ReactNode; banner?: ReactNode; // avvisi sotto la barra
+  startView?: StartView | null; // vista iniziale dei ruoli dell'utente (area, sfondo, layer accesi)
+}) {
   // con il controllo accessi attivo, ogni strumento e layer dipende dai permessi del ruolo
   const allow = (id: ToolId) => !perms || perms.tools.has(id);
   const mapEl = useRef<HTMLDivElement>(null);
@@ -62,16 +72,23 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
   const zoomEl = useRef<HTMLSpanElement>(null);
   const gsUrl = useMemo(() => toAbsolute(cfg.geoserverUrl), [cfg.geoserverUrl]);
   const initialHash = useRef(readHash());
+  const hadState = useRef(/^#s=/.test(window.location.hash)); // link o vista: la vista iniziale e i layer accesi di default non si applicano
+  // l'area di interesse del ruolo sostituisce MAP_BBOX (pulsante "area di interesse" e apertura senza link)
+  const aoiCfg = useRef(cfg); aoiCfg.current = startView?.bbox ? { ...cfg, mapBounds: startView.bbox } : cfg;
   const basemaps = useMemo(() => resolveBasemaps(cfg), [cfg]);
-  const [basemap, setBasemap] = useState(() => pickBasemap(basemaps, initialHash.current.b).id);
+  const [basemap, setBasemap] = useState(() => pickBasemap(basemaps, initialHash.current.b ?? (hadState.current ? undefined : startView?.basemap)).id);
   const basemapRef = useRef(basemap); basemapRef.current = basemap;
 
   const [mapReady, setMapReady] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [products, setProducts] = useState<Product[]>([]);
+  const [catalogTree, setCatalogTree] = useState<CatalogNode[] | null>(null); // null = nessun catalogo: elenco per workspace
+  const [defaults, setDefaults] = useState<string[]>([]);                      // layer accesi all'apertura (catalogo)
   const [active, setActive] = useState<string[]>([]);                  // ordine di accensione
   const [layers, setLayers] = useState<Record<string, LayerState>>({}); // opacità, filtro CQL e data per layer
   const [layerErrors, setLayerErrors] = useState<Record<string, string>>({});
+  const [mvtOk, setMvtOk] = useState(false); // GeoServer offre i vector tile (estensione vectortiles)
+  const [hover, setHover] = useState<{ x: number; y: number; layer: string; title: string; rows: [string, string][] } | null>(null);
   const [restored, setRestored] = useState(false);
   const [filter, setFilter] = useState("");
   const [loading, setLoading] = useState(true);
@@ -93,6 +110,7 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
   const [compare, setCompare] = useState<CompareState | null>(null);                      // confronto con cursore
   const [viewsOpen, setViewsOpen] = useState(false);                                       // pannello delle viste salvate
   const [infoLayer, setInfoLayer] = useState<string | null>(null);                         // scheda informativa di un layer
+  const [downloadLayer, setDownloadLayer] = useState<string | null>(null);                 // pannello di scarico dei dati
 
   // l'editing è un'opzione di configurazione; con Keycloak può richiedere un ruolo. I permessi veri li applica GeoServer.
   const canEdit = !!cfg.editEnabled && allow("edit") && (!cfg.editRole || !kc || kc.hasRealmRole(cfg.editRole) || kc.hasResourceRole(cfg.editRole));
@@ -100,6 +118,8 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
   // valori "freschi" per gli handler della mappa, registrati una sola volta
   const toolRef = useRef(tool); toolRef.current = tool;
   const activeRef = useRef(active); activeRef.current = active;
+  const layersRef = useRef<Record<string, LayerState>>({});
+  const mvtOkRef = useRef(mvtOk); mvtOkRef.current = mvtOk;
   const productsRef = useRef(new Map<string, Product>());
   const infoSeq = useRef(0);
   const editSeq = useRef(0);
@@ -148,10 +168,12 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
   // --- mappa ---
   useEffect(() => {
     const v = initialHash.current.v;
+    const roleBox = !v && !hadState.current ? startView?.bbox : undefined;
     const map = new maplibregl.Map({
       container: mapEl.current!,
       center: v ? [v[0], v[1]] : cfg.mapCenter,
       zoom: v ? v[2] : cfg.mapZoom,
+      ...(roleBox ? { bounds: [[roleBox[0], roleBox[1]], [roleBox[2], roleBox[3]]] as [[number, number], [number, number]], fitBoundsOptions: { padding: 30 } } : {}),
       pitch: v?.[3] ?? 0,
       bearing: v?.[4] ?? 0,
       style: basemapStyle(basemaps, basemapRef.current),
@@ -159,7 +181,7 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
       transformRequest: (url) => (url.startsWith(gsUrl) && kc?.token ? { url, headers: { Authorization: `Bearer ${kc.token}` } } : { url }),
     });
     map.addControl(new maplibregl.NavigationControl(), "top-right");
-    map.addControl(new AoiControl(() => goToAoi(map, cfg)), "top-right");
+    map.addControl(new AoiControl(() => goToAoi(map, aoiCfg.current)), "top-right");
     map.addControl(new maplibregl.FullscreenControl(), "top-right");
     map.addControl(new maplibregl.GeolocateControl({ positionOptions: { enableHighAccuracy: true }, trackUserLocation: true, showAccuracyCircle: true }), "top-right");
     map.addControl(new maplibregl.ScaleControl({ unit: "metric" }), "bottom-left");
@@ -176,6 +198,7 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
     map.on("error", (e: any) => {
       const sid: string | undefined = e.sourceId;
       if (sid?.startsWith("wms-")) setLayerError(sid.slice(4), "Alcuni tile non si caricano: controlla filtro, data e permessi.");
+      if (sid?.startsWith("vt-")) setLayerError(sid.slice(3), "Alcuni vector tile non si caricano: controlla filtro, data e permessi.");
     });
 
     // layer di servizio: evidenziazione, misure ed editing (sempre sopra ai layer WMS)
@@ -196,8 +219,34 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
         paint: { "circle-radius": 5, "circle-color": "#fff", "circle-stroke-color": "#0a6cc4", "circle-stroke-width": 2.5 },
       });
       addEditLayers(map, "#c2185b");
+      // segnaposto: i layer dei prodotti (immagini e vettori) stanno sotto, evidenziazione e misure sopra
+      map.addSource("vt-anchor", { type: "geojson", data: EMPTY });
+      map.addLayer({ id: "vt-hover-line", type: "line", source: "vt-anchor" }, "hl-fill");
       setMapReady(true);
     });
+
+    // passando il mouse su un layer vettoriale: l'oggetto, senza chiedere nulla a GeoServer
+    let hoverKey = "";
+    let hoverLayer = "";
+    const clearHover = () => {
+      if (hoverLayer) setVectorHover(map, hoverLayer, null);
+      hoverKey = ""; hoverLayer = ""; setHover(null); map.getCanvas().style.cursor = "";
+    };
+    map.on("mousemove", (e) => {
+      const ids = activeRef.current.filter((n) => layersRef.current[n]?.vt).flatMap(vtLayerIds).filter((id) => map.getLayer(id));
+      const f = ids.length && toolRef.current === "pan" ? map.queryRenderedFeatures(e.point, { layers: ids })[0] : undefined;
+      if (!f) { if (hoverKey) clearHover(); return; }
+      const name = String(f.source).slice(3);
+      const key = `${name}|${f.id ?? JSON.stringify(f.properties)}`;
+      setHover({ x: e.point.x, y: e.point.y, layer: productsRef.current.get(name)?.title ?? name, ...hoverLabel(f.properties ?? {}) });
+      if (key !== hoverKey) {
+        if (hoverLayer && hoverLayer !== name) setVectorHover(map, hoverLayer, null);
+        hoverKey = key; hoverLayer = name;
+        setVectorHover(map, name, identityFilter(f.id, f.properties ?? {}));
+      }
+      map.getCanvas().style.cursor = "pointer";
+    });
+    map.on("mouseout", () => clearHover());
 
     // interrogazione WMS GetFeatureInfo su tutti i layer attivi
     const runInfo = async (lngLat: { lng: number; lat: number }) => {
@@ -280,6 +329,11 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
       origin: window.location.origin, geoserverUrl: cfg.geoserverUrl, gsUrl, auth: kc ? "keycloak" : "disabilitata", edit: canEdit,
     });
     const ctrl = new AbortController();
+    // catalogo prodotti (cartelle, ordine, titoli, nascosti, accesi): solo con il controllo accessi, dove esistono le tabelle.
+    // Se non si legge, l'elenco resta quello per workspace: la mappa non deve fermarsi per questo.
+    const catalogP: Promise<Catalog> = cfg.access?.enabled && perms
+      ? loadCatalog(gsUrl, kc, cfg.access).catch((e) => { console.warn("[mapp] catalogo prodotti non disponibile, elenco per workspace:", e?.message ?? e); return EMPTY_CATALOG; })
+      : Promise.resolve(EMPTY_CATALOG);
     fetch(url, { headers: kc?.token ? { Authorization: `Bearer ${kc.token}` } : {}, signal: ctrl.signal })
       .then((r) => {
         console.info("[mapp] GetCapabilities risposta", { url, status: r.status, contentType: r.headers.get("content-type"), redirected: r.redirected, finalUrl: r.url });
@@ -297,7 +351,18 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
         list = markVector(list, await fetchVectorNames(gsUrl, kc?.token, ctrl.signal));
         if (cfg.access?.enabled) list = list.filter((p) => !isConfigLayer(cfg.access!, p.name)); // tabelle di configurazione, mai in mappa
         if (perms) list = list.filter((p) => layerAllowed(perms, p.name));
-        console.info(`[mapp] ${list.length} layer trovati`);
+        const cat = await catalogP;
+        list = applyCatalog(list, cat);
+        let tree: CatalogNode[] | null = null;
+        if (!isEmptyCatalog(cat)) {
+          // gli admin vedono anche cartelle e layer nascosti (marcati); per gli altri non esistono
+          tree = buildTree(list, cat, { includeHidden: !!perms?.admin });
+          list = flattenLayers(tree).map((n) => n.product);
+        }
+        console.info(`[mapp] ${list.length} layer trovati${tree ? " (catalogo)" : ""}`);
+        setMvtOk(supportsMvt(xml));
+        setCatalogTree(tree);
+        setDefaults(tree ? defaultOnLayers(tree) : []);
         productsRef.current = new Map(list.map((p) => [p.name, p]));
         setProducts(list);
       })
@@ -315,12 +380,15 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
   const addLayer = (name: string, init?: Partial<LayerState>) => {
     const map = mapRef.current;
     if (!map || !map.getLayer("hl-fill")) return;
-    const st: LayerState = { opacity: init?.opacity ?? 1, cql: init?.cql ?? "", time: init?.time ?? "", style: init?.style ?? "" };
+    const vt = !!init?.vt && mvtOkRef.current && productsRef.current.get(name)?.vector !== false;
+    const st: LayerState = { opacity: init?.opacity ?? 1, cql: init?.cql ?? "", time: init?.time ?? "", style: init?.style ?? "", ...(vt ? { vt: true } : {}) };
     const id = `wms-${name}`;
     const url = wmsTileUrl(gsUrl, name, { cql: st.cql, time: st.time, style: st.style });
     if (!map.getSource(id)) map.addSource(id, { type: "raster", tiles: [url], tileSize: 256 });
     // i layer WMS stanno sotto a evidenziazione, misure ed editing
-    if (!map.getLayer(id)) map.addLayer({ id, type: "raster", source: id, paint: { "raster-opacity": st.opacity } }, "hl-fill");
+    if (!map.getLayer(id)) map.addLayer({ id, type: "raster", source: id, paint: { "raster-opacity": st.opacity }, ...(vt ? { layout: { visibility: "none" } } : {}) }, "vt-hover-line");
+    if (vt) addVectorLayer(map, name, vtTileUrl(gsUrl, name, { cql: st.cql, time: st.time }), vtColorOf(name), st.opacity, "vt-hover-line");
+    layersRef.current = { ...layersRef.current, [name]: st };
     tileUrls.current.set(name, url);
     setLayers((p) => ({ ...p, [name]: st }));
     setActive((p) => (p.includes(name) ? p : [...p, name]));
@@ -331,6 +399,7 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
     const id = `wms-${name}`;
     if (map?.getLayer(id)) map.removeLayer(id);
     if (map?.getSource(id)) map.removeSource(id);
+    if (map) removeVectorLayer(map, name);
     tileUrls.current.delete(name);
     setActive((p) => p.filter((n) => n !== name));
     setLayers((p) => { const { [name]: _drop, ...rest } = p; return rest; });
@@ -343,13 +412,32 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
 
   const toggle = (name: string) => {
     if (!mapReady) return;
-    if (active.includes(name)) removeLayer(name); else addLayer(name);
+    if (active.includes(name)) removeLayer(name); else { addLayer(name); track("layer", name); }
   };
 
   const patchLayer = (name: string, patch: Partial<LayerState>) => setLayers((p) => ({ ...p, [name]: { ...p[name], ...patch } }));
 
+  /** Immagine (WMS) o vettoriale (vector tiles): stesso layer, stessi filtri; cambia solo chi disegna. */
+  const setRender = (name: string, vt: boolean) => {
+    const map = mapRef.current;
+    if (!map) return;
+    const st = layers[name];
+    if (vt) {
+      addVectorLayer(map, name, vtTileUrl(gsUrl, name, paramsFor(name), rev[name] ?? 0), vtColorOf(name), st?.opacity ?? 1, "vt-hover-line");
+      if (map.getLayer(`wms-${name}`)) map.setLayoutProperty(`wms-${name}`, "visibility", "none");
+      track("tool", "vector-tiles", name);
+    } else {
+      removeVectorLayer(map, name);
+      if (map.getLayer(`wms-${name}`)) map.setLayoutProperty(`wms-${name}`, "visibility", "visible");
+      setHover(null);
+    }
+    layersRef.current = { ...layersRef.current, [name]: { ...st, vt } };
+    patchLayer(name, { vt });
+  };
+
   const changeOpacity = (name: string, v: number) => {
     mapRef.current?.setPaintProperty(`wms-${name}`, "raster-opacity", v);
+    if (mapRef.current && layers[name]?.vt) setVectorOpacity(mapRef.current, name, v);
     patchLayer(name, { opacity: v });
   };
 
@@ -382,6 +470,7 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
       const url = wmsTileUrl(gsUrl, name, paramsFor(name), rev[name] ?? 0);
       if (tileUrls.current.get(name) !== url) {
         (map.getSource(`wms-${name}`) as maplibregl.RasterTileSource | undefined)?.setTiles([url]);
+        if (layers[name]?.vt) setVectorTiles(map, name, vtTileUrl(gsUrl, name, paramsFor(name), rev[name] ?? 0));
         tileUrls.current.set(name, url);
         setLayerError(name, null);
       }
@@ -389,11 +478,19 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, layers, selection, rev, mapReady, gsUrl]);
 
-  // ripristino dei layer dal link, appena si conoscono i prodotti
+  // ripristino dei layer dal link, appena si conoscono i prodotti; senza link, i layer accesi di default del catalogo
   useEffect(() => {
     if (restored || !mapReady || products.length === 0) return;
-    for (const [name, opacity, cql, time, style] of initialHash.current.l) {
-      if (productsRef.current.has(name)) addLayer(name, { opacity, cql, time, style });
+    if (hadState.current) {
+      for (const [name, opacity, cql, time, style, render] of initialHash.current.l) {
+        if (productsRef.current.has(name)) addLayer(name, { opacity, cql, time, style, vt: render === "v" });
+      }
+    } else {
+      // layer della vista del ruolo, se li indica, altrimenti quelli accesi di default nel catalogo; nell'ordine dell'elenco.
+      // In ordine inverso: l'ultimo acceso sta sopra, così il primo dell'elenco è in cima alla mappa e ai layer attivi
+      const order = products.map((p) => p.name);
+      const names = startView?.layers ? order.filter((n) => startView.layers!.includes(n)) : defaults;
+      for (const name of [...names].reverse()) if (productsRef.current.has(name)) addLayer(name);
     }
     setRestored(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -441,13 +538,14 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
     selectTool("pan");
     for (const n of [...activeRef.current]) removeLayer(n);
     let missing = 0;
-    for (const [name, opacity, cql, time, style] of st.l) {
-      if (productsRef.current.has(name)) addLayer(name, { opacity, cql, time, style });
+    for (const [name, opacity, cql, time, style, render] of st.l) {
+      if (productsRef.current.has(name)) addLayer(name, { opacity, cql, time, style, vt: render === "v" });
       else missing++;
     }
     if (st.b && basemaps.some((b) => b.id === st.b)) setBasemap(st.b);
     if (st.v) m.easeTo({ center: [st.v[0], st.v[1]], zoom: st.v[2], pitch: st.v[3] ?? 0, bearing: st.v[4] ?? 0, duration: 600 });
     flash(missing > 0 ? `Vista aperta: ${missing} layer non più disponibili` : "Vista aperta");
+    track("view", "vista salvata");
   };
 
   const openViews = () => { setViewsOpen((o) => !o); setInfoLayer(null); setExportOpen(false); };
@@ -456,6 +554,7 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
 
   // --- strumenti ---
   const selectTool = (t: Tool) => {
+    if (t !== "pan" && t !== tool) track("tool", t);
     setTool(t);
     setPts([]);
     if (t !== "series") setSeriesPt(null);
@@ -491,6 +590,7 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
   const doExport = async () => {
     const map = mapRef.current;
     if (!map) return;
+    track("tool", "export");
     setExporting(true);
     try {
       const legends: LegendItem[] = [];
@@ -516,7 +616,8 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
     for (const p of shown) m.set(p.workspace, [...(m.get(p.workspace) ?? []), p]);
     return Array.from(m.entries()).sort((a, b) => a[0].localeCompare(b[0]));
   }, [products, q]);
-  const shownCount = groups.reduce((n, [, items]) => n + items.length, 0);
+  const shownTree = useMemo(() => (catalogTree ? filterTree(catalogTree, q) : null), [catalogTree, q]);
+  const shownCount = shownTree ? countLayers(shownTree) : groups.reduce((n, [, items]) => n + items.length, 0);
   const map = mapRef.current;
 
   // istanti disponibili per i layer con TIME (slider, serie storica, confronto)
@@ -556,7 +657,7 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
           { key: `a|${compare.a}|${layers[compare.a]?.style ?? ""}`, layer: compare.a, title: titleOf(compare.a), style: layers[compare.a]?.style, tag: "A" },
           { key: `b|${compare.b}|${bParams.style ?? ""}`, layer: compare.b, title: titleOf(compare.b), style: bParams.style, tag: "B" },
         ]
-    : [...active].reverse().map((n) => ({ key: n, layer: n, title: titleOf(n), style: layers[n]?.style }));
+    : [...active].reverse().map((n) => ({ key: n, layer: n, title: titleOf(n), style: layers[n]?.style, ...(layers[n]?.vt ? { swatch: vtColorOf(n) } : {}) }));
 
   // durante il confronto la mappa principale mostra solo il layer A; gli altri tornano visibili all'uscita
   useEffect(() => {
@@ -564,9 +665,45 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
     if (!m || !mapReady) return;
     for (const name of active) {
       const id = `wms-${name}`;
-      if (m.getLayer(id)) m.setLayoutProperty(id, "visibility", compare && name !== compare.a ? "none" : "visible");
+      const shown = !(compare && name !== compare.a);
+      if (layers[name]?.vt) setVectorVisible(m, name, shown);
+      else if (m.getLayer(id)) m.setLayoutProperty(id, "visibility", shown ? "visible" : "none");
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [compare, active, mapReady]);
+
+  // --- elenco dei prodotti: una voce per layer, cartelle del catalogo annidate ---
+  const indent = (depth: number, base: number) => (depth > 0 ? { paddingLeft: base + depth * 14 } : undefined);
+  const renderItem = (p: Product, depth: number, hidden: boolean) => {
+    const on = active.includes(p.name);
+    return (
+      <label key={p.name} className={`item${on ? " on" : ""}${mapReady ? "" : " disabled"}${hidden ? " is-hidden" : ""}`} title={p.abstract ? `${p.name}\n${p.abstract}` : p.name} style={indent(depth, 22)}>
+        <input type="checkbox" checked={on} disabled={!mapReady} onChange={() => toggle(p.name)} />
+        <span className="grow">{p.title}</span>
+        {hidden && <span className="tag off" title="Nascosto agli utenti: lo vedi perché sei amministratore">nascosto</span>}
+        <button
+          className={`icon-btn item-info${infoLayer === p.name ? " on" : ""}`}
+          title="Scheda del layer"
+          aria-label={`Scheda di ${p.title}`}
+          onClick={(e) => { e.preventDefault(); e.stopPropagation(); openLayerInfo(p.name); }}
+        >
+          <IconDoc />
+        </button>
+      </label>
+    );
+  };
+  const renderNodes = (nodes: CatalogNode[], depth: number, single: boolean): ReactNode =>
+    nodes.map((n) => (n.kind === "layer" ? renderItem(n.product, depth, n.hidden) : (
+      <details className={`group${n.hidden ? " is-hidden" : ""}`} key={`f:${n.key}`} data-folder={n.key} open={q !== "" || n.expanded || single}>
+        <summary style={indent(depth, 12)} title={n.description || undefined}>
+          {n.title}
+          {n.hidden && <span className="tag off" title="Nascosta agli utenti: la vedi perché sei amministratore">nascosta</span>}
+          <span className="count">{countLayers(n.children)}</span>
+        </summary>
+        {n.description && <div className="group-desc" style={indent(depth, 30)}>{n.description}</div>}
+        {renderNodes(n.children, depth + 1, false)}
+      </details>
+    )));
 
   const tools: { id: Tool; title: string; icon: ReactNode }[] = [
     { id: "pan", title: "Navigazione", icon: <IconPan /> },
@@ -590,8 +727,8 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
             gsUrl={gsUrl}
             kc={kc}
             getBias={() => { const c = mapRef.current?.getCenter(); return c ? { lng: c.lng, lat: c.lat } : undefined; }}
-            onPlace={goToPlace}
-            onHit={goToHit}
+            onPlace={(p) => { track("search", "luogo"); goToPlace(p); }}
+            onHit={(h) => { track("search", "attributo", h.layer); goToHit(h); }}
           />
         )}
         <div className="spacer" />
@@ -605,6 +742,7 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
           </>
         )}
       </header>
+      {banner}
 
       <div className="body">
         <aside className={`sidebar${sidebarOpen ? "" : " closed"}`}>
@@ -637,6 +775,17 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
                         {canEdit && isVec && (
                           <button className={`icon-btn${editing?.layer === name ? " on" : ""}`} title="Modifica oggetti" onClick={() => openEditor(name)}><IconEdit /></button>
                         )}
+                        {allow("download") && p && (
+                          <button
+                            className={`icon-btn${downloadLayer === name ? " on" : ""}`}
+                            title="Scarica dati"
+                            aria-label={`Scarica i dati di ${p.title}`}
+                            aria-pressed={downloadLayer === name}
+                            onClick={() => setDownloadLayer((d) => (d === name ? null : name))}
+                          >
+                            <IconDownload />
+                          </button>
+                        )}
                         {p?.bbox && <button className="icon-btn" title="Zoom sul layer" onClick={() => zoomToProduct(p)}><IconZoom /></button>}
                         <button className="icon-btn" title="Rimuovi dalla mappa" onClick={() => removeLayer(name)}><IconClose /></button>
                       </div>
@@ -645,6 +794,13 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
                         <input type="range" min={0} max={1} step={0.05} value={st.opacity} onChange={(e) => changeOpacity(name, Number(e.target.value))} />
                         {Math.round(st.opacity * 100)}%
                       </label>
+                      {mvtOk && isVec && (
+                        <div className="render-switch" role="radiogroup" aria-label={`Disegno di ${p?.title ?? name}`}>
+                          <span className="muted">Disegno</span>
+                          <button role="radio" aria-checked={!st.vt} className={!st.vt ? "on" : ""} title="Immagine di GeoServer, con lo stile del layer" onClick={() => st.vt && setRender(name, false)}>Immagine</button>
+                          <button role="radio" aria-checked={!!st.vt} className={st.vt ? "on" : ""} title="Vector tiles disegnati nel browser: nessun limite di oggetti, passando il mouse si vede l'oggetto; colore unico, non lo stile di GeoServer" onClick={() => !st.vt && setRender(name, true)}>Vettoriale</button>
+                        </div>
+                      )}
                       <FilterBox
                         cql={st.cql}
                         noCql={!isVec}
@@ -668,29 +824,15 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
             {!loading && !error && (
               <>
                 <div className="section-title">Disponibili</div>
-                {groups.length === 0 && <div className="empty">Nessun prodotto trovato.</div>}
-                {groups.map(([ws, items]) => (
-                  <details className="group" key={ws} open={q !== "" || groups.length === 1}>
-                    <summary>{ws}<span className="count">{items.length}</span></summary>
-                    {items.map((p) => {
-                      const on = active.includes(p.name);
-                      return (
-                        <label key={p.name} className={`item${on ? " on" : ""}${mapReady ? "" : " disabled"}`} title={p.name}>
-                          <input type="checkbox" checked={on} disabled={!mapReady} onChange={() => toggle(p.name)} />
-                          <span className="grow">{p.title}</span>
-                          <button
-                            className={`icon-btn item-info${infoLayer === p.name ? " on" : ""}`}
-                            title="Scheda del layer"
-                            aria-label={`Scheda di ${p.title}`}
-                            onClick={(e) => { e.preventDefault(); e.stopPropagation(); openLayerInfo(p.name); }}
-                          >
-                            <IconDoc />
-                          </button>
-                        </label>
-                      );
-                    })}
-                  </details>
-                ))}
+                {shownCount === 0 && <div className="empty">Nessun prodotto trovato.</div>}
+                {shownTree
+                  ? renderNodes(shownTree, 0, shownTree.length === 1)
+                  : groups.map(([ws, items]) => (
+                      <details className="group" key={ws} open={q !== "" || groups.length === 1}>
+                        <summary>{ws}<span className="count">{items.length}</span></summary>
+                        {items.map((p) => renderItem(p, 0, false))}
+                      </details>
+                    ))}
               </>
             )}
           </div>
@@ -699,6 +841,13 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
         <div className="main">
           <div className="map-area">
             <div className="map-el" ref={mapEl} />
+            {hover && (
+              <div className="vt-tip" role="tooltip" style={{ left: hover.x + 14, top: hover.y + 14 }}>
+                <div className="muted">{hover.layer}</div>
+                <strong>{hover.title}</strong>
+                {hover.rows.length > 0 && <dl>{hover.rows.map(([k, v]) => <div key={k}><dt>{k}</dt><dd>{v}</dd></div>)}</dl>}
+              </div>
+            )}
 
             <div className="toolbar">
               {tools.filter((t) => t.id === "pan" || allow(t.id === "info" ? "info" : t.id === "series" ? "series" : "measure")).map((t) => (
@@ -745,6 +894,19 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
               </div>
             )}
 
+            {downloadLayer && active.includes(downloadLayer) && byName.get(downloadLayer) && mapReady && map && (
+              <DownloadPanel
+                key={downloadLayer}
+                gsUrl={gsUrl}
+                kc={kc}
+                product={byName.get(downloadLayer)!}
+                cql={paramsFor(downloadLayer).cql ?? ""}
+                time={layers[downloadLayer]?.time ?? ""}
+                map={map}
+                maxFeatures={cfg.downloadMaxFeatures}
+                onClose={() => setDownloadLayer(null)}
+              />
+            )}
             {viewsOpen && mapReady && map && (
               <ViewsPanel gsUrl={gsUrl} kc={kc} access={cfg.access} capture={captureNow} onApply={applyView} onClose={() => setViewsOpen(false)} />
             )}
@@ -814,6 +976,7 @@ export default function App({ cfg, kc, perms = null, nav = null }: { cfg: AppCon
                 title={byName.get(editing.layer)?.title ?? editing.layer}
                 params={paramsFor(editing.layer)}
                 initial={editing.initial}
+                access={cfg.access?.enabled && perms ? cfg.access : undefined}
                 onClose={() => setEditing(null)}
                 onSaved={() => setRev((r) => ({ ...r, [editing.layer]: (r[editing.layer] ?? 0) + 1 }))}
               />

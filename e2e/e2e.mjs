@@ -1,48 +1,19 @@
-import { chromium } from "/opt/npm-tools/node_modules/playwright-core/index.mjs";
+// Scenario principale: proxy in sola lettura e scrittura, elenco prodotti, TIME, CQL, Feature Info, editing WFS-T, dashboard,
+// tabella, link condivisibile, misure, 3D, export PNG, tema scuro.
 import { execSync, spawn } from "node:child_process";
 import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { J, MOCK, crash, launchBrowser, prepare, results as collect, shot, sleep, startNginx, waitFor as waitLong } from "./lib.mjs";
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const PROJ = path.resolve(here, "../proj");
-const RUN = path.join(here, "run");
-const MOCK = "http://127.0.0.1:8600";
-const results = [];
-const check = (name, ok, extra = "") => { results.push([name, !!ok]); console.log(`${ok ? "PASS" : "FAIL"}  ${name}${ok ? "" : "  " + extra}`); };
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function waitFor(fn, ms = 8000) { const t = Date.now(); let last; while (Date.now() - t < ms) { try { last = await fn(); if (last) return last; } catch (e) { last = e; } await sleep(100); } return false; }
+const { check, finish } = collect();
+const waitFor = (fn, ms = 8000) => waitLong(fn, ms);
 const dq = (l) => decodeURIComponent(l.query);
-const J = async (u) => (await fetch(MOCK + u)).json();
 const st = () => J("/__state");
 const resetMock = () => J("/__reset");
-
-// ---------------------------------------------------------------- nginx reale con la config generata dagli script di entrypoint
-function startNginx(name, port, env) {
-  const d = path.join(RUN, name);
-  fs.rmSync(d, { recursive: true, force: true });
-  for (const x of ["proxy.d", "html", "tmp"]) fs.mkdirSync(path.join(d, x), { recursive: true });
-  fs.cpSync(path.join(PROJ, "dist"), path.join(d, "html"), { recursive: true });
-  fs.rmSync(path.join(d, "html/config.json"), { force: true });
-  const sub = (s) => s.replaceAll("/etc/nginx/proxy.d", `${d}/proxy.d`).replaceAll("/usr/share/nginx/html", `${d}/html`);
-  const out = {};
-  for (const sc of ["35-proxy-config.sh", "40-runtime-config.sh"]) {
-    const src = sub(fs.readFileSync(`/mnt/user-data/outputs/docker-entrypoint.d/${sc}`, "utf8"));
-    fs.writeFileSync(path.join(d, sc), src);
-    out[sc] = execSync(`sh ${path.join(d, sc)}`, { env: { PATH: process.env.PATH, ...env }, encoding: "utf8" });
-  }
-  let conf = sub(fs.readFileSync("/mnt/user-data/outputs/nginx/default.conf", "utf8"))
-    .replace("listen 8080", `listen ${port}`).replace("access_log /dev/stdout mapp", `access_log ${d}/access.log mapp`).replace("error_log  /dev/stderr warn", `error_log ${d}/server-error.log warn`);
-  fs.writeFileSync(path.join(d, "default.conf"), conf);
-  fs.writeFileSync(path.join(d, "nginx.conf"), `user root;\npid ${d}/nginx.pid;\nerror_log ${d}/error.log;\nevents {}\nhttp {\n include /etc/nginx/mime.types;\n client_body_temp_path ${d}/tmp/b; proxy_temp_path ${d}/tmp/p; fastcgi_temp_path ${d}/tmp/f; uwsgi_temp_path ${d}/tmp/u; scgi_temp_path ${d}/tmp/s;\n include ${d}/default.conf;\n}\n`);
-  execSync(`nginx -t -c ${d}/nginx.conf -p ${d} 2>&1`);
-  execSync(`nginx -c ${d}/nginx.conf -p ${d}`);
-  return { d, out, url: `http://127.0.0.1:${port}`, stop: () => { try { execSync(`kill $(cat ${d}/nginx.pid)`); } catch {} } };
-}
 
 const baseEnv = {
   AUTH_ENABLED: "false", GEOSERVER_PROXY_URL: `${MOCK}/geoserver`, GEOSERVER_USER: "reader", GEOSERVER_PASSWORD: "rpass",
   BASEMAP_TILES: `${MOCK}/tiles/{z}/{x}/{y}.png`, APP_TITLE: 'Test <&> "app"', APP_ACCENT: "#0a6cc4", MAP_CENTER_LON: "12.5", MAP_CENTER_LAT: "41.9", MAP_ZOOM: "9",
+  GEOCODER: "off", // il geocoder qui non serve: niente dipendenza dal DNS di nominatim.openstreetmap.org
 };
 
 // ---------------------------------------------------------------- geometria dello schermo (Web Mercator, tile da 512 px)
@@ -51,11 +22,10 @@ const hashFor = (v, l) => "#s=" + encodeURIComponent(JSON.stringify({ v, l }));
 const VIEW = [12.42, 41.8675, 12, 0, 0];
 
 (async () => {
-  fs.mkdirSync(path.join(here, "shots"), { recursive: true });
-  execSync("pkill -x nginx || true");
+  prepare();
   const A = startNginx("A", 8091, { ...baseEnv, GEOSERVER_WRITE_USER: "writer", GEOSERVER_WRITE_PASSWORD: "wpass", EDIT_ENABLED: "true" });
   const B = startNginx("B", 8092, { ...baseEnv });
-  const browser = await chromium.launch({ executablePath: "/opt/pw-browsers/chromium", args: ["--no-sandbox", "--use-gl=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist"] });
+  const browser = await launchBrowser();
   const errors = [];
   const openPage = async (base, hash = "", scheme = "light", { geo = false } = {}) => {
     const ctx = await browser.newContext({ viewport: { width: 1400, height: 900 }, colorScheme: scheme, acceptDownloads: true, permissions: geo ? ["geolocation"] : [] });
@@ -108,7 +78,7 @@ const VIEW = [12.42, 41.8675, 12, 0, 0];
   check("raster: time inviato a GetMap", await waitFor(async () => (await J("/__log")).some((l) => /layers=iride%3Andvi/.test(l.query) && /time=2026-06-01/.test(l.query))));
   await page.locator('.active-card:has-text("NDVI") [title="Rimuovi dalla mappa"]').click();
   await openGroups(page); await page.locator('label.item:has-text("Sensori") input').check();
-  const sel = page.locator('.active-card:has-text("Sensori") select');
+  const sel = page.locator('.active-card:has-text("Sensori") select[aria-label="Data del layer"]');
   check("TIME discreto -> menu con 3 date", await waitFor(async () => (await sel.locator("option").count()) === 4));
   await sel.selectOption("2026-02-01");
   check("TIME: GetMap con time=2026-02-01", await waitFor(async () => (await J("/__log")).some((l) => /layers=iride%3Asensors/.test(l.query) && /time=2026-02-01/.test(l.query))));
@@ -168,7 +138,7 @@ const VIEW = [12.42, 41.8675, 12, 0, 0];
   for (let i = 1; i <= 8; i++) await page.mouse.move(vx + (dx * i) / 8, vy + (dy * i) / 8);
   await page.mouse.up();
   check("trascinamento vertice: 'Geometria modificata'", await waitFor(async () => /Geometria modificata/.test(await page.locator(".float-panel.editor").innerText())));
-  await page.screenshot({ path: path.join(here, "shots/vertex-edit.png") });
+  await page.screenshot({ path: shot("vertex-edit.png") });
   await page.locator('.float-panel.editor button:has-text("Salva")').click();
   check("vertice: salvataggio riuscito", await waitFor(async () => /Modifiche salvate/.test(await page.locator(".float-panel.editor .ok").innerText())));
   s = await st();
@@ -203,7 +173,7 @@ const VIEW = [12.42, 41.8675, 12, 0, 0];
   check("eliminazione: riuscita", await waitFor(async () => /Oggetto eliminato/.test(await page.locator(".float-panel.editor .ok").innerText())));
   check("WFS-T Delete: 7 oggetti", (await st())["iride:parcels"].features.length === 7);
   check("dopo la scrittura i tile vengono ricaricati (_r nel GetMap)", (await J("/__log")).some((l) => /request=GetMap/i.test(l.query) && /_r=\d/.test(l.query)));
-  await page.screenshot({ path: path.join(here, "shots/after-edit.png") });
+  await page.screenshot({ path: shot("after-edit.png") });
   await page.close();
 
   // errori di scrittura mostrati all'utente (proxy in sola lettura)
@@ -263,7 +233,7 @@ const VIEW = [12.42, 41.8675, 12, 0, 0];
   check("campo data: colonne per mese", await waitFor(async () => (await page.locator(".col").count()) === 3));
   await page.locator(".viz-toggle button:has-text('Tabella')").click();
   check("vista tabella dei dati del grafico", await waitFor(async () => (await page.locator("table.viz-table tbody tr").count()) === 3));
-  await page.screenshot({ path: path.join(here, "shots/dashboard-light.png") });
+  await page.screenshot({ path: shot("dashboard-light.png") });
 
   // link condivisibile
   await page.locator(".dock-field select").selectOption("kind");
@@ -305,7 +275,7 @@ const VIEW = [12.42, 41.8675, 12, 0, 0];
   await page.locator('button.tool[title="Vista inclinata"]').click();
   check("3D: pulsante cambia titolo", await waitFor(async () => (await page.locator('button.tool[title="Torna alla vista 2D"]').count()) === 1));
   check("3D: inclinazione 60° nel link", await waitFor(async () => Math.abs((await readHash(page)).v[3] - 60) <= 1));
-  await page.screenshot({ path: path.join(here, "shots/tilt.png") });
+  await page.screenshot({ path: shot("tilt.png") });
   await page.locator('button.tool[title="Torna alla vista 2D"]').click();
   check("3D: ritorno a 2D", await waitFor(async () => (await readHash(page)).v[3] === 0));
 
@@ -315,7 +285,7 @@ const VIEW = [12.42, 41.8675, 12, 0, 0];
   await page.locator('.float-panel.export button:has-text("Scarica PNG")').click();
   const file = await dl.catch(() => null);
   let okPng = false;
-  if (file) { const p = path.join(here, "shots/export.png"); await file.saveAs(p); const buf = fs.readFileSync(p); okPng = buf.length > 5000 && buf.slice(1, 4).toString() === "PNG"; }
+  if (file) { const p = shot("export.png"); await file.saveAs(p); const buf = fs.readFileSync(p); okPng = buf.length > 5000 && buf.slice(1, 4).toString() === "PNG"; }
   check("export PNG scaricato e valido", okPng);
   await page.close();
 
@@ -325,7 +295,7 @@ const VIEW = [12.42, 41.8675, 12, 0, 0];
   await page.locator('.active-card [title="Dashboard"]').click();
   await page.locator(".dock-field select").selectOption("kind");
   await waitFor(async () => (await page.locator(".bar-row").count()) === 3);
-  await page.screenshot({ path: path.join(here, "shots/dashboard-dark.png") });
+  await page.screenshot({ path: shot("dashboard-dark.png") });
   const bg = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
   check("tema scuro: sfondo scuro", bg === "rgb(18, 26, 37)", bg);
   await page.close();
@@ -334,8 +304,5 @@ const VIEW = [12.42, 41.8675, 12, 0, 0];
   check("nessun errore JS/console durante i test", errors.length === 0, errors.slice(0, 5).join(" | "));
 
   await browser.close();
-  A.stop(); B.stop();
-  const bad = results.filter(([, ok]) => !ok);
-  console.log(`\n${results.length - bad.length}/${results.length} controlli superati`);
-  process.exit(bad.length ? 1 : 0);
-})().catch((e) => { console.error("ERRORE NEL TEST:", e); try { execSync("pkill -x nginx || true"); } catch {} process.exit(2); });
+  finish();
+})().catch(crash);

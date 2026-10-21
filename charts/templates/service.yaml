@@ -11,4 +11,5 @@ spec:
   ports:
     - name: http
       port: {{ .Values.service.port }}
-      targetPort: {{ .Values.service.targetPort }}
+      # con oauth2-proxy il traffico passa prima dal login (porta 4180), altrimenti va direttamente a nginx
+      targetPort: {{ if .Values.auth.enabled }}4180{{ else }}{{ .Values.service.targetPort }}{{ end }}

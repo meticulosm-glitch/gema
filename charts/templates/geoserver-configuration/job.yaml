@@ -1,13 +1,13 @@
 # Inizializza la configurazione di mapp-web (ruoli, dashboard e viste salvate) a ogni sync di ArgoCD, in modo idempotente:
 #   1) initContainer "init-db": con l'utenza di amministrazione crea (se serve) database, tabelle e utente applicativo in PostgreSQL
-#   2) container "publish-geoserver": crea workspace, datastore e i layer role_rules / dashboards / saved_views in GeoServer
+#   2) container "publish-geoserver": crea workspace, datastore e i layer role_rules / dashboards / saved_views / catalog_folders / catalog_layers / role_views / edit_forms / announcements / dashboard_drafts / change_log / usage_events (+ viste usage_*) in GeoServer
 # Al primo avvio fa tutto; dai sync successivi riconosce che c'è già tutto e termina subito.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: mapp-config-init
+  name: {{ include "gema.configInitName" . }}
   labels:
-    app.kubernetes.io/name: mapp-web
+    {{- include "geolibre.labels" . | nindent 4 }}
     app.kubernetes.io/component: config-init
   annotations:
     argocd.argoproj.io/hook: Sync
@@ -19,8 +19,7 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: mapp-web
-        app.kubernetes.io/component: config-init
+        {{- include "gema.configInitLabels" . | nindent 8 }}
     spec:
       restartPolicy: OnFailure
       automountServiceAccountToken: false
@@ -41,31 +40,31 @@ spec:
             - name: PGPORT
               valueFrom:
                 secretKeyRef:
-                  name: mapp-config-db
+                  name: {{ include "gema.configDbSecret" . }}
                   key: port
                   optional: true
             # utenza di AMMINISTRAZIONE: serve solo a questo passo (CREATE DATABASE, tabelle, ruolo applicativo)
             - name: PG_ADMIN_USER
               valueFrom:
                 secretKeyRef:
-                  name: mapp-config-db
+                  name: {{ include "gema.configDbSecret" . }}
                   key: PG_ADMIN_USER
             - name: PG_ADMIN_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: mapp-config-db
+                  name: {{ include "gema.configDbSecret" . }}
                   key: PG_ADMIN_PASSWORD
             # utenza APPLICATIVA (datastore GeoServer): viene creata se manca e riceve solo i diritti sulle tabelle
             - name: GS_DB_USER
               valueFrom:
                 secretKeyRef:
-                  name: mapp-config-db
+                  name: {{ include "gema.configDbSecret" . }}
                   key: gs_user
                   optional: true
             - name: GS_DB_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: mapp-config-db
+                  name: {{ include "gema.configDbSecret" . }}
                   key: gs_password
                   optional: true
             - name: MAPP_DB
@@ -76,6 +75,10 @@ spec:
               value: "true"        # "false" se il database esiste già (l'admin deve poter fare CREATE DATABASE)
             - name: POSTGIS_EXTENSION
               value: "true"        # CREATE EXTENSION postgis nel database (best effort)
+            - name: CHANGE_LOG_DAYS
+              value: {{ .Values.changeLogDays | default 0 | quote }}   # giorni di registro modifiche da conservare (0 = per sempre)
+            - name: USAGE_DAYS
+              value: {{ .Values.usageDays | default 180 | quote }}   # giorni di eventi d'uso da conservare (0 = per sempre)
           securityContext:
             runAsUser: 70                    # utente "postgres" dell'immagine alpine
             allowPrivilegeEscalation: false
@@ -110,17 +113,17 @@ spec:
               value: "true"
             - name: UPDATE_DATASTORE
               value: "true"                    # allinea un datastore già esistente (db, schema, utente, password)
-            - name: GEOSERVER_URL
-              value: "http://mapp-enterprise-lot1-geoserver/geoserver"
+            - name: GEOSERVER_URL                # URL interno per la REST API di GeoServer
+              value: {{ required "configJob.geoserverUrl è obbligatorio" .Values.configJob.geoserverUrl | quote }}
             - name: GEOSERVER_USER
               valueFrom:
                 secretKeyRef:
-                  name: mapp-config-geoserver
+                  name: {{ include "gema.configGeoserverSecret" . }}
                   key: user
             - name: GEOSERVER_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: mapp-config-geoserver
+                  name: {{ include "gema.configGeoserverSecret" . }}
                   key: password
             - name: CONFIG_WORKSPACE
               value: {{ include "gema.configWorkspace" . | quote }}
@@ -136,43 +139,47 @@ spec:
             - name: PGPORT
               valueFrom:
                 secretKeyRef:
-                  name: mapp-config-db
+                  name: {{ include "gema.configDbSecret" . }}
                   key: port
                   optional: true
             - name: GS_DB_USER
               valueFrom:
                 secretKeyRef:
-                  name: mapp-config-db
+                  name: {{ include "gema.configDbSecret" . }}
                   key: gs_user
                   optional: true
             - name: GS_DB_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: mapp-config-db
+                  name: {{ include "gema.configDbSecret" . }}
                   key: gs_password
                   optional: true
             # fallback (se GS_DB_* non sono presenti nel secret)
             - name: PGUSER
               valueFrom:
                 secretKeyRef:
-                  name: mapp-config-db
+                  name: {{ include "gema.configDbSecret" . }}
                   key: user
                   optional: true
             - name: PGPASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: mapp-config-db
+                  name: {{ include "gema.configDbSecret" . }}
                   key: password
                   optional: true
             # regole dati di GeoServer
             - name: SET_ACL
               value: "true"
+            # ruoli GeoServer (dal plugin OIDC: ROLE_ + ruolo Keycloak in maiuscolo); di default quelli di ADMIN_ROLE,
+            # VIEWER_ROLE e KNOWN_ROLES dell'app, oppure configJob.aclReadRoles / aclWriteRoles / aclViewsWriteRoles
             - name: ACL_READ_ROLES
-              value: "ROLE_FSS-ETL-VIEWER,ROLE_FSS-ETL-ADMIN"
+              value: {{ include "gema.aclReadRoles" . | quote }}
             - name: ACL_WRITE_ROLES
-              value: "ROLE_FSS-ETL-ADMIN"       # scrittura su role_rules e dashboards
-            # - name: ACL_VIEWS_WRITE_ROLES
-            #   value: "ROLE_FSS-ETL-VIEWER,ROLE_FSS-ETL-ADMIN"   # scrittura su saved_views (default = ACL_READ_ROLES)
+              value: {{ include "gema.aclWriteRoles" . | quote }}   # scrittura su role_rules, dashboards, catalogo, role_views, edit_forms, announcements e dashboard_drafts (che solo loro leggono)
+            {{- with .Values.configJob.aclViewsWriteRoles }}
+            - name: ACL_VIEWS_WRITE_ROLES
+              value: {{ . | quote }}               # scrittura su saved_views (default = ACL_READ_ROLES)
+            {{- end }}
           securityContext:
             runAsUser: 100                   # curl_user
             allowPrivilegeEscalation: false
@@ -196,7 +203,7 @@ spec:
       volumes:
         - name: scripts
           configMap:
-            name: mapp-config-init
+            name: {{ include "gema.configInitName" . }}
             defaultMode: 0555
         - name: tmp
           emptyDir:

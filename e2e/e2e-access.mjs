@@ -1,54 +1,25 @@
 // Test dei ruoli: Keycloak finto (admin / viewer / ruolo senza regole), pagine admin, dashboard, scritture negate.
-import { chromium } from "/opt/npm-tools/node_modules/playwright-core/index.mjs";
 import { execSync } from "node:child_process";
 import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { J, MOCK, crash, goAdmin, launchBrowser, prepare, results, shot, sleep, startNginx, runtimeConfig, waitFor } from "./lib.mjs";
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const PROJ = path.resolve(here, "../proj");
-const RUN = path.join(here, "run");
-const MOCK = "http://127.0.0.1:8600";
-const results = [];
-const check = (name, ok, extra = "") => { results.push([name, !!ok]); console.log(`${ok ? "PASS" : "FAIL"}  ${name}${ok ? "" : "  " + extra}`); };
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function waitFor(fn, ms = 10000) { const t = Date.now(); let last; while (Date.now() - t < ms) { try { last = await fn(); if (last) return last; } catch (e) { last = e; } await sleep(100); } return false; }
-const J = async (u) => (await fetch(MOCK + u)).json();
+const { check, finish } = results();
+
 const st = () => J("/__state");
 const asRole = (roles, user = "bob") => J(`/__kc?user=${user}&roles=${encodeURIComponent(roles)}`);
-
-function startNginx(name, port, env) {
-  const d = path.join(RUN, name);
-  fs.rmSync(d, { recursive: true, force: true });
-  for (const x of ["proxy.d", "html", "tmp"]) fs.mkdirSync(path.join(d, x), { recursive: true });
-  fs.cpSync(path.join(PROJ, "dist"), path.join(d, "html"), { recursive: true });
-  fs.rmSync(path.join(d, "html/config.json"), { force: true });
-  const sub = (s) => s.replaceAll("/etc/nginx/proxy.d", `${d}/proxy.d`).replaceAll("/usr/share/nginx/html", `${d}/html`);
-  for (const sc of ["35-proxy-config.sh", "40-runtime-config.sh"]) {
-    fs.writeFileSync(path.join(d, sc), sub(fs.readFileSync(`/mnt/user-data/outputs/docker-entrypoint.d/${sc}`, "utf8")));
-    execSync(`sh ${path.join(d, sc)}`, { env: { PATH: process.env.PATH, ...env }, encoding: "utf8" });
-  }
-  const conf = sub(fs.readFileSync("/mnt/user-data/outputs/nginx/default.conf", "utf8")).replace("listen 8080", `listen ${port}`).replace("access_log /dev/stdout mapp", `access_log ${d}/access.log mapp`).replace("error_log  /dev/stderr warn", `error_log ${d}/server-error.log warn`);
-  fs.writeFileSync(path.join(d, "default.conf"), conf);
-  fs.writeFileSync(path.join(d, "nginx.conf"), `user root;\npid ${d}/nginx.pid;\nerror_log ${d}/error.log;\nevents {}\nhttp {\n include /etc/nginx/mime.types;\n client_body_temp_path ${d}/tmp/b; proxy_temp_path ${d}/tmp/p; fastcgi_temp_path ${d}/tmp/f; uwsgi_temp_path ${d}/tmp/u; scgi_temp_path ${d}/tmp/s;\n include ${d}/default.conf;\n}\n`);
-  execSync(`nginx -t -c ${d}/nginx.conf -p ${d} 2>&1`);
-  execSync(`nginx -c ${d}/nginx.conf -p ${d}`);
-  return { d, url: `http://127.0.0.1:${port}`, stop: () => { try { execSync(`kill $(cat ${d}/nginx.pid)`); } catch {} } };
-}
 
 const jwtFor = (roles) => { const b = (o) => Buffer.from(JSON.stringify(o)).toString("base64url"); return `${b({ alg: "none" })}.${b({ preferred_username: "x", resource_access: { mapp: { roles } } })}.sig`; };
 
 (async () => {
-  fs.mkdirSync(path.join(here, "shots"), { recursive: true });
-  execSync("pkill -x nginx || true");
+  prepare();
   await J("/__reset");
   const C = startNginx("C", 8093, {
     AUTH_ENABLED: "true", KEYCLOAK_URL: `${MOCK}/kc`, KEYCLOAK_REALM: "test", KEYCLOAK_CLIENT_ID: "mapp",
     ACCESS_CONTROL: "true", KNOWN_ROLES: "fss-etl-viewer, fss-etl-ops", EDIT_ENABLED: "true", GEOSERVER_WRITE_PASSTHROUGH: "true",
     GEOSERVER_PROXY_URL: `${MOCK}/geoserver`, GEOSERVER_USER: "reader", GEOSERVER_PASSWORD: "rpass",
-    BASEMAP_TILES: `${MOCK}/tiles/{z}/{x}/{y}.png`, APP_TITLE: "Test ruoli", MAP_CENTER_LON: "12.5", MAP_CENTER_LAT: "41.9", MAP_ZOOM: "9",
+    BASEMAP_TILES: `${MOCK}/tiles/{z}/{x}/{y}.png`, APP_TITLE: "Test ruoli", MAP_CENTER_LON: "12.5", MAP_CENTER_LAT: "41.9", MAP_ZOOM: "9", GEOCODER: "off",
   });
-  const browser = await chromium.launch({ executablePath: "/opt/pw-browsers/chromium", args: ["--no-sandbox", "--use-gl=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist"] });
+  const browser = await launchBrowser();
   const errors = [];
   const open = async (urlPath = "/") => {
     const ctx = await browser.newContext({ viewport: { width: 1400, height: 900 } });
@@ -72,7 +43,7 @@ const jwtFor = (roles) => { const b = (o) => Buffer.from(JSON.stringify(o)).toSt
   check("scrittura con token admin: accettata", post(`Bearer ${jwtFor(["fss-etl-admin"])}`) === "200");
   check("scrittura senza token: rifiutata (401), nessuna credenziale fissa iniettata", post("") === "401");
   check("POST su altri endpoint resta vietato (403)", execSync(`curl -s -o /dev/null -w '%{http_code}' -X POST '${C.url}/geoserver/rest/workspaces' -d x`, { encoding: "utf8" }) === "403");
-  check("config: ACCESS_CONTROL ignorato senza Keycloak", (() => { const d = fs.mkdtempSync("/tmp/cfgx-"); fs.mkdirSync(d + "/h"); const s = fs.readFileSync("/mnt/user-data/outputs/docker-entrypoint.d/40-runtime-config.sh", "utf8").replaceAll("/usr/share/nginx/html", d + "/h"); fs.writeFileSync(d + "/s.sh", s); execSync(`sh ${d}/s.sh`, { env: { PATH: process.env.PATH, AUTH_ENABLED: "false", ACCESS_CONTROL: "true" } }); return !fs.readFileSync(d + "/h/config.json", "utf8").includes('"access"'); })());
+  check("config: ACCESS_CONTROL ignorato senza Keycloak", !runtimeConfig({ AUTH_ENABLED: "false", ACCESS_CONTROL: "true" }).includes('"access"'));
 
   // ---------------------------------------------------------------- ruoli senza accesso / viewer senza regole
   console.log("\n== viewer ==");
@@ -91,6 +62,7 @@ const jwtFor = (roles) => { const b = (o) => Buffer.from(JSON.stringify(o)).toSt
   await page.waitForSelector(".active-card");
   check("viewer: niente pulsante di modifica anche con EDIT_ENABLED", (await page.locator('.active-card [title="Modifica oggetti"]').count()) === 0);
   check("viewer: tabella e grafici sul layer presenti", (await page.locator('.active-card [title="Tabella attributi"]').count()) === 1 && (await page.locator('.active-card [title="Dashboard"]').count()) === 1);
+  check("viewer senza regole: 'Scarica dati' presente (strumenti predefiniti)", (await page.locator('.active-card [title="Scarica dati"]').count()) === 1);
   await page.close();
   page = await open("/admin/roles");
   check("viewer su /admin/roles: accesso negato", await waitFor(async () => /Accesso negato/.test(await page.locator(".page").innerText())));
@@ -105,8 +77,10 @@ const jwtFor = (roles) => { const b = (o) => Buffer.from(JSON.stringify(o)).toSt
   await page.locator('label.item:has-text("Particelle") input').check();
   await page.waitForSelector(".active-card");
   check("admin: pulsante di modifica visibile (EDIT_ENABLED + ruolo)", (await page.locator('.active-card [title="Modifica oggetti"]').count()) === 1);
-  check("admin: menu Admin nella barra", (await page.locator(".nav-tag").count()) === 1 && (await page.locator('.nav a:has-text("Ruoli e permessi")').count()) === 1);
-  await page.locator('.nav a:has-text("Ruoli e permessi")').click();
+  await page.locator("button.nav-tag").click();
+  check("admin: menu Admin nella barra con le pagine", (await page.locator(".nav-tag").count()) === 1 && JSON.stringify(await page.locator(".nav-menu a").allInnerTexts()) === JSON.stringify(["Ruoli e permessi", "Catalogo prodotti", "Moduli di modifica", "Avvisi", "Crea dashboard", "Registro modifiche", "Statistiche d'uso", "Backup e ripristino", "Diagnostica"]));
+  await page.locator('.nav-menu a:has-text("Ruoli e permessi")').click();
+  check("admin: la pagina corrente compare sul pulsante del menu", /Ruoli e permessi/.test(await page.locator("button.nav-tag").innerText()) && (await page.locator(".nav-menu").count()) === 0);
   check("pagina ruoli: titolo, nota 'nessuna regola', card admin bloccata", await waitFor(async () => /Ruoli e permessi/.test(await page.locator("h1").innerText()) && /Nessuna regola salvata/.test(await page.locator(".page").innerText()) && (await page.locator(".role-card.locked").count()) === 1));
   check("pagina ruoli: card per i ruoli da KNOWN_ROLES e VIEWER_ROLE", await waitFor(async () => (await page.locator(".role-card[data-role]").count()) === 2));
   const vcard = page.locator('.role-card[data-role="fss-etl-viewer"]');
@@ -115,12 +89,13 @@ const jwtFor = (roles) => { const b = (o) => Buffer.from(JSON.stringify(o)).toSt
   check("salva disabilitato senza layer scelti", await vcard.locator('button:has-text("Salva regola")').isDisabled());
   await vcard.locator('.check-list .check:has-text("Particelle") input').check();
   await vcard.locator('.check-list .check:has-text("Sensori") input').check();
-  for (const t of ["Misure e coordinate", "Vista 3D", "Stampa / esporta", "Grafici sul layer"]) await vcard.locator(`.check:has-text("${t}") input`).uncheck();
+  // la regola deve lasciare solo "Interroga oggetti" e "Tabella attributi"
+  for (const t of ["Misure e coordinate", "Vista 3D", "Stampa / esporta", "Grafici sul layer", "Serie storica in un punto", "Confronto con cursore", "Ricerca luoghi e attributi", "Viste salvate", "Scarica dati"]) await vcard.locator(`.check:has-text("${t}") input`).uncheck();
   await vcard.locator('button:has-text("Salva regola")').click();
   check("regola salvata (messaggio)", await waitFor(async () => /Regola di fss-etl-viewer salvata/.test(await page.locator(".page .ok").innerText())));
   let s = await st();
   const rr = s["mapp:role_rules"].features;
-  check("WFS-T: riga in role_rules con layer e strumenti", rr.length === 1 && rr[0].properties.role === "fss-etl-viewer" && JSON.stringify(JSON.parse(rr[0].properties.layers)) === JSON.stringify(["iride:parcels", "iride:sensors"]) && JSON.parse(rr[0].properties.tools).sort().join() === "edit".slice(0, 0) + ["info", "table"].join(), JSON.stringify(rr[0]?.properties));
+  check("WFS-T: riga in role_rules con layer e strumenti", rr.length === 1 && rr[0].properties.role === "fss-etl-viewer" && JSON.stringify(JSON.parse(rr[0].properties.layers)) === JSON.stringify(["iride:parcels", "iride:sensors"]) && JSON.parse(rr[0].properties.tools).sort().join() === ["info", "table"].join(), JSON.stringify(rr[0]?.properties));
   check("dopo il salvataggio la nota 'nessuna regola' sparisce", await waitFor(async () => !/Nessuna regola salvata/.test(await page.locator(".page").innerText())));
   check("regola salvata registra l'utente", rr[0].properties.updated_by === "alice");
   // modifica di una regola esistente (update, non insert)
@@ -132,13 +107,13 @@ const jwtFor = (roles) => { const b = (o) => Buffer.from(JSON.stringify(o)).toSt
   await page.fill('.add-role input', "fss-etl-analyst");
   await page.locator('.add-role button:has-text("Aggiungi ruolo")').click();
   check("aggiunta di un ruolo nuovo (non salvato)", await waitFor(async () => (await page.locator('.role-card[data-role="fss-etl-analyst"] .chip:has-text("non salvata")').count()) === 1));
-  await page.screenshot({ path: path.join(here, "shots/admin-roles.png"), fullPage: true });
+  await page.screenshot({ path: shot("admin-roles.png"), fullPage: true });
 
   // ---------------------------------------------------------------- admin: dashboard
   console.log("\n== admin: dashboard ==");
-  await page.locator('.nav a:has-text("Crea dashboard")').click();
+  await goAdmin(page, "Crea dashboard");
   await page.waitForSelector(".dash-editor");
-  check("crea dashboard: salvataggio bloccato finché mancano dati", await page.locator('.dash-editor button:has-text("Salva dashboard")').isDisabled() && /Manca il titolo/.test(await page.locator(".problems").innerText()));
+  check("crea dashboard: salvataggio bloccato finché mancano dati", await page.locator('.dash-editor button:text-is("Pubblica")').isDisabled() && /Manca il titolo/.test(await page.locator(".problems").innerText()));
   await page.locator('.dash-editor .form-grid label:has(> span:text-is(\"Titolo\")) input').first().fill("Monitoraggio particelle");
   await page.locator('.dash-editor .check-row .check:has-text("fss-etl-viewer") input').check();
   const addW = () => page.locator('.dash-editor button:has-text("Aggiungi widget")').click();
@@ -168,10 +143,10 @@ const jwtFor = (roles) => { const b = (o) => Buffer.from(JSON.stringify(o)).toSt
   check("anteprima: barre per tipo (3)", await waitFor(async () => (await page.locator(".dash-grid .widget").nth(1).locator(".bar-row").count()) === 3));
   check("anteprima: istogramma a 10 classi", await waitFor(async () => (await page.locator(".dash-grid .widget").nth(2).locator(".col").count()) === 10));
   check("anteprima: somma delle aree = 2.800", await waitFor(async () => /2\.800/.test(await page.locator(".dash-grid .widget").nth(3).locator(".k-value").innerText())));
-  await page.screenshot({ path: path.join(here, "shots/admin-dashboards.png"), fullPage: true });
-  check("nessun problema residuo, salvataggio abilitato", await waitFor(async () => (await page.locator(".problems").count()) === 0 && !(await page.locator('button:has-text("Salva dashboard")').isDisabled())));
-  await page.locator('button:has-text("Salva dashboard")').click();
-  check("dashboard salvata", await waitFor(async () => /Dashboard salvata/.test(await page.locator(".page .ok").innerText())));
+  await page.screenshot({ path: shot("admin-dashboards.png"), fullPage: true });
+  check("nessun problema residuo, salvataggio abilitato", await waitFor(async () => (await page.locator(".problems").count()) === 0 && !(await page.locator('button:text-is("Pubblica")').isDisabled())));
+  await page.locator('button:text-is("Pubblica")').click();
+  check("dashboard pubblicata", await waitFor(async () => /Dashboard pubblicata/.test(await page.locator(".page .ok").innerText())));
   s = await st();
   const dd = s["mapp:dashboards"].features;
   check("WFS-T: riga in dashboards con ruoli e 4 widget", dd.length === 1 && dd[0].properties.title === "Monitoraggio particelle" && JSON.parse(dd[0].properties.roles).join() === "fss-etl-viewer" && JSON.parse(dd[0].properties.definition).length === 4, JSON.stringify(dd[0]?.properties).slice(0, 300));
@@ -189,12 +164,13 @@ const jwtFor = (roles) => { const b = (o) => Buffer.from(JSON.stringify(o)).toSt
   await page.locator('label.item:has-text("Particelle") input').check();
   await page.waitForSelector(".active-card");
   check("viewer: tabella sì, grafici sul layer no, modifica no", (await page.locator('.active-card [title="Tabella attributi"]').count()) === 1 && (await page.locator('.active-card [title="Dashboard"]').count()) === 0 && (await page.locator('.active-card [title="Modifica oggetti"]').count()) === 0);
+  check("viewer con regola senza 'Scarica dati': nessun pulsante di scarico", (await page.locator('.active-card [title="Scarica dati"]').count()) === 0);
   await page.locator('.nav a:has-text("Dashboard")').click();
   check("viewer: elenco con la dashboard assegnata", await waitFor(async () => (await page.locator(".card-link").count()) === 1 && /Monitoraggio particelle/.test(await page.locator(".card-link").innerText())));
   await page.locator(".card-link").click();
   check("dashboard del viewer: 4 widget", await waitFor(async () => (await page.locator(".widget").count()) === 4));
   check("dashboard del viewer: KPI 7 e barre A/B/C", await waitFor(async () => (await page.locator(".widget").nth(0).locator(".k-value").innerText()) === "7" && (await page.locator(".widget").nth(1).locator(".bar-row").count()) === 3));
-  await page.screenshot({ path: path.join(here, "shots/dashboard-viewer.png"), fullPage: true });
+  await page.screenshot({ path: shot("dashboard-viewer.png"), fullPage: true });
   await page.locator(".widget").nth(1).locator(".bar-row").first().click();
   check("clic su una barra: apre la mappa con il filtro", await waitFor(async () => page.url().includes("/#s=") && (await page.locator(".active-card").count()) === 1 && (await page.locator('.active-card .filterbox input.search').first().inputValue()) === "kind = 'A'"));
   await page.close();
@@ -214,7 +190,7 @@ const jwtFor = (roles) => { const b = (o) => Buffer.from(JSON.stringify(o)).toSt
   await page.locator(".dash-item").click();
   await page.locator('button:has-text("Elimina")').click();
   check("dashboard eliminata (WFS-T Delete)", await waitFor(async () => (await st())["mapp:dashboards"].features.length === 0));
-  await page.locator('.nav a:has-text("Ruoli e permessi")').click();
+  await goAdmin(page, "Ruoli e permessi");
   await waitFor(async () => (await page.locator('.role-card[data-role="fss-etl-viewer"] button:has-text("Elimina regola")').count()) === 1);
   await page.locator('.role-card[data-role="fss-etl-viewer"] button:has-text("Elimina regola")').click();
   check("regola eliminata", await waitFor(async () => (await st())["mapp:role_rules"].features.length === 0));
@@ -238,8 +214,5 @@ const jwtFor = (roles) => { const b = (o) => Buffer.from(JSON.stringify(o)).toSt
 
   check("nessun errore JS/console durante i test", errors.length === 0, errors.slice(0, 5).join(" | "));
   await browser.close();
-  C.stop();
-  const bad = results.filter(([, ok]) => !ok);
-  console.log(`\n${results.length - bad.length}/${results.length} controlli superati`);
-  process.exit(bad.length ? 1 : 0);
-})().catch((e) => { console.error("ERRORE NEL TEST:", e); try { execSync("pkill -x nginx || true"); } catch {} process.exit(2); });
+  finish();
+})().catch(crash);

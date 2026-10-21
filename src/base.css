@@ -1,0 +1,3 @@
+/* Stili di base della pagina: qui e non in index.html, perché la Content-Security-Policy non ammette stili inline. */
+html, body, #root { height: 100%; margin: 0; font-family: system-ui, sans-serif; }
+.boot-error { padding: 16px; white-space: pre-wrap; }

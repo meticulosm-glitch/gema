@@ -7,7 +7,12 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:unit": "vitest run",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:integration:docker": "sh test/integration/run-docker.sh",
+    "test:e2e": "npm run build && npm --prefix e2e ci --no-audit --no-fund && node e2e/run.mjs",
+    "test:all": "npm run test:unit && npm run test:integration:docker && npm run test:e2e"
   },
   "dependencies": {
     "keycloak-js": "^26.0.0",
@@ -22,9 +27,11 @@
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^5.0.0",
     "@xmldom/xmldom": "^0.9.12",
+    "geotiff": "^2.1.3",
     "jsdom": "^29.1.1",
     "typescript": "^5.6.0",
     "vite": "^7.0.0",
-    "vitest": "^5.0.4"
+    "vitest": "^5.0.4",
+    "yaml": "^2.9.1"
   }
 }

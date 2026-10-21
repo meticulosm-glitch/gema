@@ -21,6 +21,10 @@ export interface AppConfig {
   basemaps?: { id: string; label: string; tiles?: string; attribution?: string; maxzoom?: number }[]; // sfondi selezionabili; assente = mappa, satellite, scuro, nessuno
   geocoder?: { type: "nominatim" | "photon"; url: string; country?: string; lang?: string }; // ricerca di luoghi; assente = solo ricerca per attributo
   access?: AccessConfig;  // ruoli, pagine admin e dashboard per ruolo (richiede Keycloak)
+  downloadMaxFeatures?: number; // tetto di oggetti per uno scarico vettoriale (default 50000)
+  clientErrors?: boolean; // errori JavaScript del browser a /client-errors, nel log di nginx (default true)
+  wmsTiled?: boolean;     // aggiunge tiled=true alle GetMap (integrazione diretta WMS di GeoWebCache)
+  usageStats?: "off" | "anonymous" | "named"; // statistiche d'uso (default anonymous: ruoli e sessione, senza nome utente)
 }
 
 export interface AccessConfig {

@@ -1,20 +1,31 @@
 # ConfigMap con lo script SQL e i due script di inizializzazione di mapp-web.
-# Il contenuto è la fonte unica: lo legge il Job mapp-config-init (job.yaml).
+# Il contenuto è la fonte unica: lo legge il Job <rilascio>-config-init (job.yaml).
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: mapp-config-init
+  name: {{ include "gema.configInitName" . }}
   labels:
-    app.kubernetes.io/name: mapp-web
+    {{- include "geolibre.labels" . | nindent 4 }}
     app.kubernetes.io/component: config-init
   annotations:
     argocd.argoproj.io/sync-wave: "0"   # prima del Job
 data:
   mapp-config.sql: |
-    -- Tabelle di configurazione di mapp-web (ruoli -> permessi, dashboard, viste salvate). Idempotente: si può rieseguire.
+    -- Tabelle di configurazione di mapp-web (ruoli -> permessi, dashboard, viste salvate, catalogo prodotti, vista iniziale
+    -- per ruolo, moduli di modifica, avvisi). Idempotente: si può rieseguire.
     -- Variabili psql (le passa init-db.sh):
     --   schema   schema che contiene le tabelle (default gema_config)
     --   gs_user  utente PostgreSQL del datastore GeoServer (la password arriva dall'ambiente, GS_DB_PASSWORD)
+    --   log_days giorni di registro modifiche da conservare (CHANGE_LOG_DAYS; 0 = per sempre)
+    --   usage_days giorni di eventi d'uso da conservare (USAGE_DAYS; default 180; 0 = per sempre)
+    \if :{?log_days}
+    \else
+      \set log_days 0
+    \endif
+    \if :{?usage_days}
+    \else
+      \set usage_days 180
+    \endif
     CREATE SCHEMA IF NOT EXISTS :"schema";
 
     CREATE TABLE IF NOT EXISTS :"schema".role_rules (
@@ -45,6 +56,184 @@ data:
     );
     CREATE INDEX IF NOT EXISTS saved_views_owner_idx ON :"schema".saved_views (owner);
 
+    -- Catalogo prodotti: come appaiono i layer di GeoServer nell'elenco della mappa (pagina Admin -> Catalogo prodotti).
+    -- Cartelle (anche annidate) e layer condividono l'ordinamento: `position` ordina gli elementi della stessa cartella.
+    -- Nessuna foreign key tra le due tabelle: un layer con una cartella che non esiste più torna al primo livello,
+    -- e l'app salva tutto in un'unica transazione WFS-T. I testi facoltativi ammettono NULL: un elemento vuoto in una
+    -- transazione WFS-T può arrivare al database come NULL, e l'app lo legge come stringa vuota.
+    CREATE TABLE IF NOT EXISTS :"schema".catalog_folders (
+      id          serial PRIMARY KEY,
+      folder_key  text NOT NULL UNIQUE CHECK (folder_key <> ''),  -- identificativo stabile (non cambia se la cartella si rinomina)
+      parent_key  text DEFAULT '',              -- cartella che la contiene; '' (o NULL) = primo livello
+      title       text NOT NULL CHECK (btrim(title) <> ''),
+      description text DEFAULT '',
+      position    integer NOT NULL DEFAULT 0,
+      expanded    boolean NOT NULL DEFAULT false, -- aperta quando si apre la mappa
+      hidden      boolean NOT NULL DEFAULT false, -- nasconde la cartella con tutto il contenuto
+      updated_by  text,
+      updated_at  timestamptz DEFAULT now(),
+      CONSTRAINT catalog_folders_not_self CHECK (parent_key <> folder_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS :"schema".catalog_layers (
+      id          serial PRIMARY KEY,
+      layer       text NOT NULL UNIQUE CHECK (layer <> ''),  -- nome GeoServer, es. iride:ndvi
+      folder_key  text DEFAULT '',              -- '' (o NULL) = primo livello
+      position    integer NOT NULL DEFAULT 0,
+      title       text DEFAULT '',              -- '' (o NULL) = titolo di GeoServer
+      description text DEFAULT '',              -- '' (o NULL) = descrizione (Abstract) di GeoServer
+      hidden      boolean NOT NULL DEFAULT false, -- fuori dall'elenco (non è un permesso: quelli li danno i ruoli e GeoServer)
+      default_on  boolean NOT NULL DEFAULT false, -- acceso quando la mappa si apre senza un link o una vista
+      updated_by  text,
+      updated_at  timestamptz DEFAULT now(),
+      CONSTRAINT catalog_layers_hidden_not_on CHECK (NOT (hidden AND default_on))
+    );
+
+    -- Vista iniziale per ruolo (pagina Admin -> Ruoli e permessi): area, sfondo e layer accesi quando la mappa si apre
+    -- senza un link o una vista salvata. Campi vuoti (o NULL) = impostazioni globali (MAP_BBOX, primo sfondo, catalogo).
+    CREATE TABLE IF NOT EXISTS :"schema".role_views (
+      id          serial PRIMARY KEY,
+      role        text NOT NULL UNIQUE CHECK (role <> ''),
+      bbox        text DEFAULT '',              -- "ovest,sud,est,nord" in gradi
+      basemap     text DEFAULT '',              -- id dello sfondo
+      layers      text DEFAULT '[]',            -- JSON: ["iride:ndvi", ...]
+      updated_by  text,
+      updated_at  timestamptz DEFAULT now(),
+      CONSTRAINT role_views_bbox_format CHECK (bbox IS NULL OR bbox = '' OR bbox ~ '^-?[0-9]+(\.[0-9]+)?(,-?[0-9]+(\.[0-9]+)?){3}$')
+    );
+
+    -- Moduli di modifica (pagina Admin -> Moduli di modifica): per ogni layer, come appaiono i campi nell'editor
+    -- (etichette, ordine, obbligatori, sola lettura, nascosti, menu a tendina, valori predefiniti). Regole dell'interfaccia:
+    -- i vincoli veri dei dati restano quelli delle tabelle dei layer.
+    CREATE TABLE IF NOT EXISTS :"schema".edit_forms (
+      id          serial PRIMARY KEY,
+      layer       text NOT NULL UNIQUE CHECK (layer <> ''),  -- nome GeoServer, es. iride:parcels
+      definition  text NOT NULL DEFAULT '[]',   -- JSON: [{"name":"kind","alias":"Tipo","required":true,"options":[...]}, ...]
+      updated_by  text,
+      updated_at  timestamptz DEFAULT now()
+    );
+
+    -- Avvisi in testa all'applicazione (pagina Admin -> Avvisi): informazioni, attenzione, manutenzione; per periodo e ruoli.
+    CREATE TABLE IF NOT EXISTS :"schema".announcements (
+      id          serial PRIMARY KEY,
+      message     text NOT NULL CHECK (btrim(message) <> '' AND length(message) <= 1000),
+      level       text NOT NULL DEFAULT 'info' CHECK (level IN ('info', 'warning', 'maintenance')),
+      starts_at   text DEFAULT '',              -- ISO 8601 con fuso; '' = subito
+      ends_at     text DEFAULT '',              -- ISO 8601 con fuso; '' = finché è attivo
+      roles       text DEFAULT '[]',            -- JSON: ruoli che lo vedono; [] = tutti
+      dismissible boolean NOT NULL DEFAULT true,
+      active      boolean NOT NULL DEFAULT true,
+      updated_by  text,
+      updated_at  timestamptz DEFAULT now(),
+      CONSTRAINT announcements_dates CHECK (
+        (starts_at IS NULL OR starts_at = '' OR starts_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}') AND
+        (ends_at IS NULL OR ends_at = '' OR ends_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}')),
+      CONSTRAINT announcements_maintenance_stays CHECK (NOT (level = 'maintenance' AND dismissible))
+    );
+
+    -- Bozze delle dashboard (pagina Admin -> Crea dashboard): le modifiche restano qui finché l'amministratore non le
+    -- pubblica; chi usa le dashboard legge solo la tabella dashboards. La leggono e la scrivono solo gli amministratori.
+    -- Una bozza per dashboard pubblicata (dashboard_id = id in dashboards); '' (o NULL) = dashboard mai pubblicata.
+    CREATE TABLE IF NOT EXISTS :"schema".dashboard_drafts (
+      id           serial PRIMARY KEY,
+      dashboard_id text DEFAULT '',
+      title        text NOT NULL CHECK (btrim(title) <> ''),
+      description  text DEFAULT '',
+      roles        text DEFAULT '[]',          -- JSON: ruoli che la vedranno una volta pubblicata
+      definition   text DEFAULT '[]',          -- JSON: come dashboards.definition (la bozza può essere incompleta)
+      updated_by   text,
+      updated_at   timestamptz DEFAULT now()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS dashboard_drafts_dashboard_uq ON :"schema".dashboard_drafts (dashboard_id)
+      WHERE dashboard_id IS NOT NULL AND dashboard_id <> '';
+
+    -- Registro delle modifiche (pagina Admin -> Registro modifiche): un trigger su ogni tabella di configurazione scrive
+    -- qui la riga prima e dopo ogni inserimento, modifica ed eliminazione. Chi ha fatto la modifica è la colonna
+    -- updated_by della riga (l'app la imposta anche prima di eliminare). Le modifiche che toccano solo updated_by /
+    -- updated_at non si registrano. L'utente applicativo può solo leggere il registro: lo scrive la funzione del trigger.
+    CREATE TABLE IF NOT EXISTS :"schema".change_log (
+      id          bigserial PRIMARY KEY,
+      table_name  text NOT NULL,
+      row_id      integer,
+      op          text NOT NULL CHECK (op IN ('INSERT', 'UPDATE', 'DELETE')),
+      old_data    text,                         -- JSON della riga prima (NULL per INSERT)
+      new_data    text,                         -- JSON della riga dopo (NULL per DELETE)
+      changed_by  text,                         -- utente dell'app (updated_by)
+      db_user     text DEFAULT current_user,    -- utente PostgreSQL (di solito quello di GeoServer)
+      changed_at  timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS change_log_row_idx ON :"schema".change_log (table_name, row_id, changed_at DESC);
+    CREATE INDEX IF NOT EXISTS change_log_time_idx ON :"schema".change_log (changed_at DESC);
+
+    CREATE OR REPLACE FUNCTION :"schema".gema_log_change() RETURNS trigger
+      LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
+    DECLARE
+      o jsonb;
+      n jsonb;
+    BEGIN
+      IF TG_OP <> 'INSERT' THEN o := to_jsonb(OLD); END IF;
+      IF TG_OP <> 'DELETE' THEN n := to_jsonb(NEW); END IF;
+      IF TG_OP = 'UPDATE' AND (o - 'updated_by' - 'updated_at') = (n - 'updated_by' - 'updated_at') THEN RETURN NEW; END IF;
+      EXECUTE format('INSERT INTO %I.change_log (table_name, row_id, op, old_data, new_data, changed_by, db_user) VALUES ($1, $2, $3, $4, $5, $6, $7)', TG_TABLE_SCHEMA)
+        USING TG_TABLE_NAME, COALESCE((n ->> 'id')::integer, (o ->> 'id')::integer), TG_OP, o::text, n::text,
+              COALESCE(n ->> 'updated_by', o ->> 'updated_by'), session_user::text;
+      RETURN COALESCE(NEW, OLD);
+    END
+    $fn$;
+
+    -- trigger sulle tabelle di configurazione (non sulle viste salvate, che sono personali, né sulle bozze)
+    SELECT format('DROP TRIGGER IF EXISTS gema_log ON %I.%I; CREATE TRIGGER gema_log AFTER INSERT OR UPDATE OR DELETE ON %I.%I FOR EACH ROW EXECUTE FUNCTION %I.gema_log_change()', :'schema', t, :'schema', t, :'schema')
+      FROM unnest(ARRAY['role_rules', 'dashboards', 'catalog_folders', 'catalog_layers', 'role_views', 'edit_forms', 'announcements']) AS t \gexec
+
+    -- conservazione (variabile log_days, da CHANGE_LOG_DAYS): 0 = per sempre
+    SELECT (:'log_days' ~ '^[1-9][0-9]{0,5}$') AS prune_log \gset
+    \if :prune_log
+    DELETE FROM :"schema".change_log WHERE changed_at < now() - make_interval(days => :log_days);
+    \endif
+
+    -- Statistiche d'uso (pagina Admin -> Statistiche d'uso): il browser di ogni utente aggiunge eventi (pagina aperta,
+    -- layer acceso, strumento, dashboard, scarico, ricerca). Gli utenti applicativi li possono solo aggiungere; li leggono
+    -- gli amministratori, già aggregati per giorno nelle viste qui sotto. username vuoto = modalità anonima (USAGE_STATS).
+    CREATE TABLE IF NOT EXISTS :"schema".usage_events (
+      id          bigserial PRIMARY KEY,
+      at          timestamptz NOT NULL DEFAULT now(),
+      session     text NOT NULL CHECK (length(session) BETWEEN 8 AND 64),
+      username    text DEFAULT '',
+      roles       text DEFAULT '[]' CHECK (roles IS NULL OR (length(roles) <= 2000 AND jsonb_typeof(roles::jsonb) = 'array')),  -- JSON: ruoli dell'utente
+      kind        text NOT NULL CHECK (kind IN ('page', 'layer', 'tool', 'dashboard', 'download', 'search', 'view')),
+      target      text DEFAULT '' CHECK (length(target) <= 200),
+      detail      text DEFAULT '' CHECK (length(detail) <= 200)
+    );
+    CREATE INDEX IF NOT EXISTS usage_events_at_idx ON :"schema".usage_events (at);
+
+    -- per giorno e oggetto: quante volte e da quante sessioni / utenti
+    CREATE OR REPLACE VIEW :"schema".usage_daily AS
+      SELECT (at AT TIME ZONE 'UTC')::date AS day, kind, coalesce(target, '') AS target,
+             count(*)::integer AS events, count(DISTINCT session)::integer AS sessions,
+             count(DISTINCT nullif(username, ''))::integer AS users
+      FROM :"schema".usage_events GROUP BY 1, 2, 3;
+    -- per giorno: sessioni, utenti ed eventi in totale
+    CREATE OR REPLACE VIEW :"schema".usage_sessions AS
+      SELECT (at AT TIME ZONE 'UTC')::date AS day, count(*)::integer AS events, count(DISTINCT session)::integer AS sessions,
+             count(DISTINCT nullif(username, ''))::integer AS users
+      FROM :"schema".usage_events GROUP BY 1;
+    -- per giorno e ruolo (un utente con più ruoli conta in ciascuno)
+    CREATE OR REPLACE VIEW :"schema".usage_roles AS
+      SELECT (e.at AT TIME ZONE 'UTC')::date AS day, r.role, count(*)::integer AS events, count(DISTINCT e.session)::integer AS sessions
+      FROM :"schema".usage_events e
+      CROSS JOIN LATERAL jsonb_array_elements_text(coalesce(nullif(e.roles, ''), '[]')::jsonb) AS r(role)
+      GROUP BY 1, 2;
+
+    -- per giorno e utente (solo con USAGE_STATS=named: in modalità anonima è vuota)
+    CREATE OR REPLACE VIEW :"schema".usage_users AS
+      SELECT (at AT TIME ZONE 'UTC')::date AS day, username, count(*)::integer AS events, count(DISTINCT session)::integer AS sessions
+      FROM :"schema".usage_events WHERE coalesce(username, '') <> '' GROUP BY 1, 2;
+
+    SELECT (:'usage_days' ~ '^[1-9][0-9]{0,5}$') AS prune_usage \gset
+    \if :prune_usage
+    DELETE FROM :"schema".usage_events WHERE at < now() - make_interval(days => :usage_days);
+    \endif
+
     -- Utente applicativo = quello che GeoServer usa per il datastore. Se è diverso da chi esegue lo script (l'admin):
     --   * viene creato se manca (solo LOGIN, nessun altro privilegio) e la sua password è allineata a GS_DB_PASSWORD;
     --   * riceve solo i diritti sul database, sullo schema e sulle sue tabelle (anche su quelle create in futuro).
@@ -62,6 +251,10 @@ data:
     GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA :"schema" TO :"gs_user";
     ALTER DEFAULT PRIVILEGES IN SCHEMA :"schema" GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO :"gs_user";
     ALTER DEFAULT PRIVILEGES IN SCHEMA :"schema" GRANT USAGE, SELECT ON SEQUENCES TO :"gs_user";
+    -- il registro si legge soltanto: lo scrive il trigger (SECURITY DEFINER)
+    REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON :"schema".change_log FROM :"gs_user";
+    -- gli eventi d'uso si aggiungono soltanto (né modifiche né cancellazioni via GeoServer)
+    REVOKE UPDATE, DELETE, TRUNCATE ON :"schema".usage_events FROM :"gs_user";
     \endif
 
   init-db.sh: |
@@ -123,12 +316,13 @@ data:
     fi
 
     echo "[init-db] applico lo schema $SCHEMA su $DB (utente applicativo: ${GS_USER:-nessuno})"
-    psql_admin -d "$DB" -v ON_ERROR_STOP=1 -v schema="$SCHEMA" -v gs_user="$GS_USER" -f /scripts/mapp-config.sql
+    psql_admin -d "$DB" -v ON_ERROR_STOP=1 -v schema="$SCHEMA" -v gs_user="$GS_USER" -v log_days="${CHANGE_LOG_DAYS:-0}" -v usage_days="${USAGE_DAYS:-180}" -f /scripts/mapp-config.sql
     echo "[init-db] fatto"
 
   publish-geoserver.sh: |
     #!/bin/sh
-    # Passo 2: pubblica in GeoServer workspace, datastore e i layer (role_rules, dashboards, saved_views) via REST.
+    # Passo 2: pubblica in GeoServer workspace, datastore e i layer di configurazione (role_rules, dashboards, saved_views,
+    # catalog_folders, catalog_layers, role_views, edit_forms, announcements, dashboard_drafts, change_log, usage_events e le viste usage_daily, usage_sessions, usage_roles, usage_users) via REST.
     # Idempotente: ciò che esiste già non viene toccato. Disattivabile con PUBLISH_GEOSERVER=false.
     set -eu
 
@@ -146,7 +340,7 @@ data:
     # il datastore usa SEMPRE l'utente applicativo (mai l'amministratore del database)
     DBUSER="${GS_DB_USER:-${PGUSER:?GS_DB_USER o PGUSER mancante}}"
     DBPASS="${GS_DB_PASSWORD:-${PGPASSWORD:?GS_DB_PASSWORD o PGPASSWORD mancante}}"
-    TABLES="role_rules dashboards saved_views"
+    TABLES="role_rules dashboards saved_views catalog_folders catalog_layers role_views edit_forms announcements dashboard_drafts change_log usage_events usage_daily usage_sessions usage_roles usage_users"
     UPDATE_DS="${UPDATE_DATASTORE:-false}"
     TMP="${TMPDIR:-/tmp}"
 
@@ -243,7 +437,7 @@ data:
       else die "lettura del layer $WS:$t fallita (HTTP $s)"; fi
     done
 
-    # --- regole dati (opzionale): ruoli e dashboard si leggono dai ruoli applicativi e si scrivono solo dall'admin;
+    # --- regole dati (opzionale): ruoli, dashboard e catalogo si leggono dai ruoli applicativi e si scrivono solo dall'admin;
     #     le viste salvate le scrive chiunque abbia un ruolo applicativo (ognuno salva le proprie)
     if [ "${SET_ACL:-false}" = "true" ]; then
       READ="${ACL_READ_ROLES:?ACL_READ_ROLES mancante (es. ROLE_FSS-ETL-VIEWER,ROLE_FSS-ETL-ADMIN)}"
@@ -257,11 +451,23 @@ data:
         if grep -q "\"$key\"" "$TMP/acl.json"; then s=$(api PUT /rest/security/acl/layers "$rule"); else s=$(api POST /rest/security/acl/layers "$rule"); fi
         case "$s" in 200|201) echo "[geoserver] regola $key = $3" ;; *) die "regola $key non applicata (HTTP $s)" ;; esac
       }
-      for t in role_rules dashboards; do acl "$t" r "$READ"; acl "$t" w "$WRITE"; done
+      for t in role_rules dashboards catalog_folders catalog_layers role_views edit_forms announcements; do acl "$t" r "$READ"; acl "$t" w "$WRITE"; done
+      # le bozze delle dashboard restano agli amministratori: nemmeno la lettura ai ruoli applicativi
+      acl dashboard_drafts r "$WRITE"
+      acl dashboard_drafts w "$WRITE"
+      # il registro modifiche lo leggono solo gli amministratori dell'app e non lo scrive nessuno (nemmeno il database lo consente)
+      acl change_log r "$WRITE"
+      acl change_log w "ADMIN"
+      # statistiche d'uso: tutti i ruoli applicativi aggiungono eventi (il database non consente modifiche né cancellazioni).
+      # GeoServer nasconde i layer non leggibili, quindi per aggiungere serve anche la lettura della tabella grezza; le viste
+      # aggregate le leggono solo gli amministratori. Con USAGE_STATS=named la tabella grezza contiene i nomi utente.
+      acl usage_events r "$READ"
+      acl usage_events w "$READ"
+      for t in usage_daily usage_sessions usage_roles usage_users; do acl "$t" r "$WRITE"; acl "$t" w "ADMIN"; done
       acl saved_views r "$READ"
       acl saved_views w "$VIEWS_WRITE"
     else
-      echo "[geoserver] regole dati non toccate (SET_ACL=false): ricordati di limitare la scrittura su $WS:role_rules e $WS:dashboards al ruolo admin (e quella su $WS:saved_views ai ruoli applicativi)"
+      echo "[geoserver] regole dati non toccate (SET_ACL=false): ricordati di limitare la scrittura su $WS:role_rules, $WS:dashboards, $WS:catalog_folders, $WS:catalog_layers, $WS:role_views, $WS:edit_forms e $WS:announcements al ruolo admin, lettura e scrittura su $WS:dashboard_drafts al ruolo admin (e la scrittura su $WS:saved_views ai ruoli applicativi)"
     fi
 
     # --- verifica finale: lo schema deve essere leggibile via WFS come lo legge l'app

@@ -27,7 +27,7 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: http
-              containerPort: 80
+              containerPort: 8080          # nginx-unprivileged
           {{- $envVars := dict }}
           {{- range .Values.env }}
             {{- $_ := set $envVars .name . }}
@@ -55,16 +55,18 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: tiles                    # cache dei tile di nginx (TILE_CACHE=true)
+              mountPath: /tmp/nginx-tiles
         {{- if .Values.auth.enabled }}
         - name: oauth2-proxy
           image: {{ .Values.auth.image }}
           args:
             - --provider=keycloak-oidc
-            - --oidc-issuer-url={{ .Values.auth.issuerUrl }}
+            - --oidc-issuer-url={{ required "auth.issuerUrl è obbligatorio con auth.enabled (es. https://keycloak/realms/<realm>)" .Values.auth.issuerUrl }}
             - --client-id={{ .Values.auth.clientId }}
             - --allowed-role={{ .Values.auth.clientId }}:{{ .Values.auth.clientRole }}
-            - --redirect-url={{ .Values.apisixRoute.host }}/oauth2/callback
-            - --upstream=http://127.0.0.1:80
+            - --redirect-url=https://{{ required "apisixRoute.host è obbligatorio con auth.enabled" .Values.apisixRoute.host | trimPrefix "https://" | trimSuffix "/" }}/oauth2/callback
+            - --upstream=http://127.0.0.1:8080   # nginx nello stesso pod
             - --http-address=0.0.0.0:4180
             - --email-domain=*
             - --scope=openid email profile
@@ -107,6 +109,9 @@ spec:
       volumes:
         - name: data
           emptyDir: {}
+        - name: tiles
+          emptyDir:
+            sizeLimit: {{ .Values.tileCacheSizeLimit | default "2Gi" }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

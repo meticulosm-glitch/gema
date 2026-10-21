@@ -112,6 +112,33 @@ export async function fetchVectorNames(gsUrl: string, token?: string, signal?: A
   }
 }
 
+/** Layer pubblicati in WCS (scaricabili come GeoTIFF) da un WCS 2.0 GetCapabilities; gli id "ws__nome" diventano "ws:nome". */
+export function parseWcsCoverages(xml: string): Set<string> {
+  const doc = new DOMParser().parseFromString(xml, "text/xml");
+  if (doc.querySelector("parsererror")) throw new Error("risposta WCS non XML");
+  const names = new Set<string>();
+  for (const el of Array.from(doc.getElementsByTagName("*")).filter((e) => e.localName === "CoverageId")) {
+    const id = el.textContent?.trim();
+    if (id) names.add(id.replace("__", ":"));
+  }
+  return names;
+}
+
+const coverageCache = new Map<string, Promise<Set<string>>>();
+/** Layer raster scaricabili (in cache per sessione). Un WCS spento o non raggiungibile dà un insieme vuoto, non un errore. */
+export function fetchCoverageNames(gsUrl: string, token?: string): Promise<Set<string>> {
+  const key = `${gsUrl}|${token ? "auth" : "anon"}`;
+  let p = coverageCache.get(key);
+  if (!p) {
+    p = fetch(`${gsUrl}/ows?service=WCS&version=2.0.1&request=GetCapabilities`, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+      .then(async (r) => (r.ok ? parseWcsCoverages(await r.text()) : new Set<string>()))
+      .catch(() => new Set<string>());
+    p.then((s) => { if (s.size === 0) coverageCache.delete(key); }); // riprova la volta dopo se era vuoto
+    coverageCache.set(key, p);
+  }
+  return p;
+}
+
 /** Marca ogni prodotto come vettoriale (presente in WFS) o raster. */
 export function markVector(list: Product[], vec: Set<string> | null): Product[] {
   return vec ? list.map((p) => ({ ...p, vector: vec.has(p.name) })) : list;

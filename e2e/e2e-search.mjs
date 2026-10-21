@@ -1,39 +1,10 @@
 // Ricerca (luoghi + attributi), sfondi, scheda del layer e viste salvate: browser reale, nginx reale, GeoServer/geocoder/Keycloak finti.
-import { chromium } from "/opt/npm-tools/node_modules/playwright-core/index.mjs";
 import { execSync } from "node:child_process";
 import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { J, MOCK, crash, launchBrowser, prepare, results as collect, shot, sleep, startNginx, waitFor } from "./lib.mjs";
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const PROJ = path.resolve(here, "..");
-const RUN = path.join(here, "run");
-const MOCK = "http://127.0.0.1:8600";
-const results = [];
-const check = (name, ok, extra = "") => { results.push([name, !!ok]); console.log(`${ok ? "PASS" : "FAIL"}  ${name}${ok ? "" : "  " + extra}`); };
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function waitFor(fn, ms = 10000) { const t = Date.now(); let last; while (Date.now() - t < ms) { try { last = await fn(); if (last) return last; } catch (e) { last = e; } await sleep(100); } return false; }
-const J = async (u) => (await fetch(MOCK + u)).json();
+const { check, finish } = collect();
 const near = (a, b, tol) => Math.abs(a - b) <= tol;
-
-function startNginx(name, port, env) {
-  const d = path.join(RUN, name);
-  fs.rmSync(d, { recursive: true, force: true });
-  for (const x of ["proxy.d", "html", "tmp"]) fs.mkdirSync(path.join(d, x), { recursive: true });
-  fs.cpSync(path.join(PROJ, "dist"), path.join(d, "html"), { recursive: true });
-  fs.rmSync(path.join(d, "html/config.json"), { force: true });
-  const sub = (s) => s.replaceAll("/etc/nginx/proxy.d", `${d}/proxy.d`).replaceAll("/usr/share/nginx/html", `${d}/html`);
-  for (const sc of ["35-proxy-config.sh", "40-runtime-config.sh"]) {
-    fs.writeFileSync(path.join(d, sc), sub(fs.readFileSync(path.join(PROJ, "docker-entrypoint.d", sc), "utf8")));
-    execSync(`sh ${path.join(d, sc)}`, { env: { PATH: process.env.PATH, ...env }, encoding: "utf8" });
-  }
-  const conf = sub(fs.readFileSync(path.join(PROJ, "nginx/default.conf"), "utf8")).replace("listen 8080", `listen ${port}`).replace("access_log /dev/stdout mapp", `access_log ${d}/access.log mapp`).replace("error_log  /dev/stderr warn", `error_log ${d}/server-error.log warn`);
-  fs.writeFileSync(path.join(d, "default.conf"), conf);
-  fs.writeFileSync(path.join(d, "nginx.conf"), `user root;\npid ${d}/nginx.pid;\nerror_log ${d}/error.log;\nevents {}\nhttp {\n include /etc/nginx/mime.types;\n client_body_temp_path ${d}/tmp/b; proxy_temp_path ${d}/tmp/p; fastcgi_temp_path ${d}/tmp/f; uwsgi_temp_path ${d}/tmp/u; scgi_temp_path ${d}/tmp/s;\n include ${d}/default.conf;\n}\n`);
-  execSync(`nginx -t -c ${d}/nginx.conf -p ${d} 2>&1`);
-  execSync(`nginx -c ${d}/nginx.conf -p ${d}`);
-  return { d, url: `http://127.0.0.1:${port}`, stop: () => { try { execSync(`kill $(cat ${d}/nginx.pid)`); } catch {} } };
-}
 
 const base = {
   GEOSERVER_PROXY_URL: `${MOCK}/geoserver`, GEOSERVER_USER: "reader", GEOSERVER_PASSWORD: "rpass",
@@ -42,9 +13,7 @@ const base = {
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "base64");
 
 (async () => {
-  fs.mkdirSync(path.join(here, "shots"), { recursive: true });
-  execSync("pkill -x nginx || true");
-  rmCache();
+  prepare();
   await J("/__reset");
   const D = startNginx("D", 8094, { ...base, AUTH_ENABLED: "false", GEOCODER: "nominatim", GEOCODER_URL: `${MOCK}/nominatim`, GEOCODER_COUNTRY: "IT", GEOCODER_USER_AGENT: "mapp-web-test" });
   const E = startNginx("E", 8095, { ...base, AUTH_ENABLED: "false", GEOCODER: "off", BASEMAPS: `osm|Mappa|${MOCK}/tiles/{z}/{x}/{y}.png|© test;nessuno|Vuoto|;rotto|Rotto|ftp://x` });
@@ -53,7 +22,7 @@ const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR
     ACCESS_CONTROL: "true", EDIT_ENABLED: "true", GEOSERVER_WRITE_PASSTHROUGH: "true", CONFIG_WORKSPACE: "mapp",
     GEOCODER: "photon", GEOCODER_URL: `${MOCK}/photon`,
   });
-  const browser = await chromium.launch({ executablePath: "/opt/pw-browsers/chromium", args: ["--no-sandbox", "--use-gl=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist"] });
+  const browser = await launchBrowser();
   const errors = [];
   const reqs = [];
   const open = async (url, { ctx, wait = ".sidebar", cookies } = {}) => {
@@ -108,7 +77,7 @@ const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR
   check("Invio: due luoghi trovati con dettaglio", await waitFor(async () => (await page.locator(".sr-item").count()) === 2 && /Puglia/.test(await page.locator(".sr-item").first().innerText())));
   const gq = (await J("/__geo")).at(-1);
   check("richiesta al geocoder: paese e lingua, via proxy, senza token", /countrycodes=it/.test(gq.query) && /accept-language=it/.test(gq.query) && gq.auth === null && gq.cookie === null, JSON.stringify(gq));
-  await page.screenshot({ path: path.join(here, "shots/search-places.png") });
+  await page.screenshot({ path: shot("search-places.png") });
   await page.locator(".sr-item").first().click();
   check("clic sul luogo: la mappa si sposta su Bari e l'elenco si chiude", await waitFor(async () => { const v = (await hash(page)).v; return near(v[0], 16.85, 0.3) && near(v[1], 41.1, 0.3); }) && (await page.locator(".search-results").count()) === 0);
   await page.fill(".hsearch input", ""); 
@@ -142,7 +111,7 @@ const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR
   check("Nessuno: nessun tile di sfondo richiesto", !reqs.some((u) => u.includes("/tiles/") || u.includes("arcgisonline") || u.includes("cartocdn")) && (await hash(page)).b === "none", reqs.join(" "));
   await page.locator(".basemap-switch [role=radio]", { hasText: "Scuro" }).click();
   check("Scuro: tile CARTO", await waitFor(() => reqs.some((u) => u.includes("cartocdn.com"))));
-  await page.screenshot({ path: path.join(here, "shots/basemap-dark.png") });
+  await page.screenshot({ path: shot("basemap-dark.png") });
   const pageB = await open(D.url + "/#s=" + encodeURIComponent(JSON.stringify({ v: [12.5, 41.9, 9, 0, 0], l: [], b: "sat" })));
   check("da link con b=sat: parte con il satellite", (await pageB.locator('.basemap-switch [aria-checked=true]').innerText()) === "Satellite");
   const pageB2 = await open(D.url + "/#s=" + encodeURIComponent(JSON.stringify({ v: [12.5, 41.9, 9, 0, 0], l: [], b: "inesistente" })));
@@ -161,7 +130,7 @@ const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR
   check("scheda: titolo, descrizione e parole chiave da GetCapabilities", await waitFor(async () => /Particelle catastali di prova/.test(await panel.innerText())) && (await panel.locator(".li-kw .chip").allInnerTexts()).join() === "catasto,particelle");
   check("scheda: oggetti (WFS hits), geometria e attributi", await waitFor(async () => { const t = await panel.innerText(); return /\b7\b/.test(t) && /MultiPolygon/.test(t) && /name, kind, area, surveyed/.test(t); }), await panel.innerText());
   check("scheda: fonte come link http(s); link javascript: scartato", (await panel.locator('a[href="https://example.org/fonte"]').count()) === 1 && (await panel.locator('a[href^="javascript"]').count()) === 0);
-  await page.screenshot({ path: path.join(here, "shots/layer-info.png") });
+  await page.screenshot({ path: shot("layer-info.png") });
   await panel.getByRole("button", { name: "Aggiungi alla mappa" }).click();
   check("scheda: 'Aggiungi alla mappa' accende il layer", await waitFor(async () => (await page.locator(".active-card").count()) === 1));
   await page.locator('label.item:has-text("NDVI")').hover(); await page.locator('label.item:has-text("NDVI") .item-info').click();
@@ -183,7 +152,7 @@ const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR
   await page.fill('.float-panel.views [aria-label="Nome della vista"]', "Particelle tipo A");
   await page.locator(".float-panel.views button:has-text('Salva')").click();
   check("vista salvata e in elenco", await waitFor(async () => /Particelle tipo A/.test(await page.locator(".view-list").innerText())));
-  await page.screenshot({ path: path.join(here, "shots/views.png") });
+  await page.screenshot({ path: shot("views.png") });
   const fresh = await open(D.url + "/", { ctx: ctxD });
   await fresh.locator('button[title="Viste salvate"]').click();
   check("dopo un ricaricamento la vista c'è ancora", await waitFor(async () => /Particelle tipo A/.test(await fresh.locator(".view-list").innerText())));
@@ -231,14 +200,9 @@ const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR
   check("Photon: ricerca automatica dopo la pausa, senza Invio", await waitFor(async () => (await pc.locator(".sr-item").count()) === 2));
   const gp = (await J("/__geo")).at(-1);
   check("Photon: richiesta a /api con lingua e bias sulla mappa, senza token", /\/photon\/api/.test(gp.path) && /lang=it/.test(gp.query) && /lat=/.test(gp.query) && gp.auth === null, JSON.stringify(gp));
-  await pc.screenshot({ path: path.join(here, "shots/photon.png") });
+  await pc.screenshot({ path: shot("photon.png") });
   console.log("\n== errori nel browser ==");
   check("nessun errore JS/console", errors.length === 0, errors.slice(0, 5).join(" | "));
   await browser.close();
-  for (const n of [D, E, C]) n.stop();
-  const failed = results.filter(([, ok]) => !ok);
-  console.log(`\n${results.length - failed.length}/${results.length} controlli superati`);
-  process.exit(failed.length ? 1 : 0);
-})().catch((e) => { console.error(e); execSync("pkill -x nginx || true"); process.exit(2); });
-
-function rmCache() { fs.rmSync("/tmp/nginx-geocode", { recursive: true, force: true }); }
+  finish();
+})().catch(crash);

@@ -29,6 +29,12 @@
 #   GEOCODER_COUNTRY       limita Nominatim a uno o più paesi (codici ISO, es. it o it,sm)
 #   GEOCODER_LANG          lingua dei risultati (default it)
 #   TERRAIN_TILES          tile DEM "terrarium" per il rilievo 3D (es. https://host/{z}/{x}/{y}.png)
+#   DOWNLOAD_MAX_FEATURES  massimo di oggetti per uno scarico vettoriale (CSV, GeoJSON, Shapefile); default 50000
+#   WMS_TILED=true         aggiunge tiled=true alle GetMap: con la "integrazione diretta WMS" di GeoWebCache attiva in GeoServer
+#                          i tile si servono dalla cache di GeoServer (griglia EPSG:900913/3857 a 256 px; richieste con filtro
+#                          CQL o data passano dalla cache solo se GeoWebCache ha i filtri dei parametri configurati)
+#   CLIENT_ERRORS=false    il browser non segnala i propri errori JavaScript a /client-errors (vedi 45-security-config.sh)
+#   USAGE_STATS            statistiche d'uso (con ACCESS_CONTROL): off, anonymous (default: ruoli e sessione, nessun nome) o named
 set -eu
 CONF=/usr/share/nginx/html/config.json
 
@@ -91,6 +97,17 @@ if [ -n "$BBOX_RAW" ]; then
 fi
 
 case "${EDIT_ENABLED:-false}" in true|TRUE|True|1|yes|YES) EDIT_JSON=true ;; *) EDIT_JSON=false ;; esac
+case "${WMS_TILED:-false}" in true|TRUE|True|1|yes|YES) TILED_JSON=true ;; *) TILED_JSON=false ;; esac
+# stesso flag di 45-security-config.sh: senza /client-errors in nginx il browser non manda nulla
+case "${CLIENT_ERRORS:-true}" in false|FALSE|False|0|no|NO|off|OFF) CLIENT_ERR_JSON=false ;; *) CLIENT_ERR_JSON=true ;; esac
+
+case "${DOWNLOAD_MAX_FEATURES:-50000}" in
+  ""|*[!0-9]*|0*) echo "[config] DOWNLOAD_MAX_FEATURES ignorato (atteso un intero positivo): ${DOWNLOAD_MAX_FEATURES:-}"; DL_MAX=50000 ;;
+  *) DL_MAX="${DOWNLOAD_MAX_FEATURES:-50000}" ;;
+esac
+
+USAGE="$(printf '%s' "${USAGE_STATS:-anonymous}" | tr 'A-Z' 'a-z')"
+case "$USAGE" in off|anonymous|named) ;; *) echo "[config] USAGE_STATS ignorato (atteso off, anonymous o named): ${USAGE_STATS:-}"; USAGE=anonymous ;; esac
 
 # NB: il default va in una variabile a parte, perché le graffe di {z}/{x}/{y} dentro ${VAR:-...}
 # chiuderebbero l'espansione al primo "}" e produrrebbero un URL sbagliato.
@@ -145,6 +162,10 @@ cat > "$CONF" <<JSON
   "accent": "$(json "${APP_ACCENT:-}")",
   "editEnabled": ${EDIT_JSON},
   "editRole": "$(json "${EDIT_ROLE:-}")",
+  "downloadMaxFeatures": ${DL_MAX},
+  "usageStats": "${USAGE}",
+  "wmsTiled": ${TILED_JSON},
+  "clientErrors": ${CLIENT_ERR_JSON},
   "terrainTiles": "$(json "${TERRAIN_TILES:-}")"
 }
 JSON

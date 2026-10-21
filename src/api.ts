@@ -23,9 +23,11 @@ export interface Schema {
 const enc = encodeURIComponent;
 const hdr = (kc: Keycloak | null): Record<string, string> => (kc?.token ? { Authorization: `Bearer ${kc.token}` } : {});
 
-/** Estrae il testo di una ServiceException/ExceptionReport di GeoServer, se presente. */
-function exceptionText(body: string): string | null {
-  const m = body.match(/<(?:\w+:)?ServiceException[^>]*>([\s\S]*?)<\/(?:\w+:)?ServiceException>/);
+/** Estrae il testo di una ServiceException (WMS/WFS 1.x) o di un ows:ExceptionText (WFS 2.0, WCS 2.0) di GeoServer, se presente. */
+export function exceptionText(body: string): string | null {
+  const m =
+    body.match(/<(?:\w+:)?ServiceException[^>]*>([\s\S]*?)<\/(?:\w+:)?ServiceException>/) ??
+    body.match(/<(?:\w+:)?ExceptionText[^>]*>([\s\S]*?)<\/(?:\w+:)?ExceptionText>/);
   return m ? m[1].replace(/<!\[CDATA\[|\]\]>/g, "").replace(/\s+/g, " ").trim().slice(0, 300) || "errore di GeoServer" : null;
 }
 
@@ -46,10 +48,15 @@ async function getJson(url: string, kc: Keycloak | null, signal?: AbortSignal): 
 }
 
 /** URL dei tile WMS di un layer, con filtro CQL, tempo e un contatore per forzare il ricaricamento. */
+/** Tile a 256 px su griglia EPSG:3857: con WMS_TILED si chiede a GeoServer di servirli da GeoWebCache (tiled=true). */
+let tiledGetMap = false;
+export function setWmsTiled(on: boolean) { tiledGetMap = on; }
+
 export function wmsTileUrl(gsUrl: string, layer: string, p: LayerParams = {}, rev = 0): string {
   let u =
     `${gsUrl}/wms?service=WMS&version=1.1.1&request=GetMap&layers=${enc(layer)}` +
     `&styles=${enc(p.style?.trim() ?? "")}&format=image/png&transparent=true&srs=EPSG:3857&width=256&height=256`;
+  if (tiledGetMap) u += "&tiled=true";
   if (p.cql?.trim()) u += `&cql_filter=${enc(p.cql.trim())}`;
   if (p.time?.trim()) u += `&time=${enc(p.time.trim())}`;
   if (rev) u += `&_r=${rev}`;
@@ -97,6 +104,15 @@ export async function getWfsFeatures(
     `&outputFormat=application/json&maxFeatures=${max}&srsName=EPSG:4326`;
   if (cql?.trim()) url += `&cql_filter=${enc(cql.trim())}`;
   if (props?.length) url += `&propertyName=${enc(props.join(","))}`;
+  return ((await getJson(url, kc)).features ?? []) as Feature[];
+}
+
+/** Oggetti ordinati dal server (WFS 2.0 sortBy), i primi `count`: per leggere le righe più recenti di una tabella. */
+export async function getWfsFeaturesSorted(gsUrl: string, kc: Keycloak | null, layer: string, sortBy: string, cql?: string, count = 500): Promise<Feature[]> {
+  let url =
+    `${gsUrl}/ows?service=WFS&version=2.0.0&request=GetFeature&typeNames=${enc(layer)}` +
+    `&outputFormat=application/json&count=${count}&sortBy=${enc(sortBy)}`;
+  if (cql?.trim()) url += `&cql_filter=${enc(cql.trim())}`;
   return ((await getJson(url, kc)).features ?? []) as Feature[];
 }
 
@@ -172,6 +188,11 @@ export function describeLayer(gsUrl: string, kc: Keycloak | null, layer: string)
   return p;
 }
 
+/** Schema di una tabella letto ora, senza cache (pagina di diagnostica). */
+export async function describeTableFresh(gsUrl: string, kc: Keycloak | null, layer: string): Promise<Schema> {
+  return parseSchema(await getText(`${gsUrl}/ows?service=WFS&version=1.0.0&request=DescribeFeatureType&typeName=${enc(layer)}`, kc), layer, true);
+}
+
 /** Schema di una tabella (anche senza geometria), per le tabelle di configurazione. */
 export function describeTable(gsUrl: string, kc: Keycloak | null, layer: string): Promise<Schema> {
   const key = `${gsUrl}|${layer}|table`;
@@ -184,8 +205,8 @@ export function describeTable(gsUrl: string, kc: Keycloak | null, layer: string)
   return p;
 }
 
-/** Invia una transazione WFS-T. Lancia con un messaggio comprensibile se GeoServer o il proxy la rifiutano. */
-export async function wfsTransaction(gsUrl: string, kc: Keycloak | null, xml: string): Promise<void> {
+/** Esegue una transazione WFS-T (lancia con un messaggio comprensibile se GeoServer o il proxy la rifiutano). Restituisce gli identificativi degli oggetti inseriti (InsertResult), nell'ordine. */
+export async function wfsTransaction(gsUrl: string, kc: Keycloak | null, xml: string): Promise<string[]> {
   const r = await fetch(`${gsUrl}/wfs`, { method: "POST", headers: { "Content-Type": "text/xml", ...hdr(kc) }, body: xml });
   const body = await r.text();
   if (r.status === 401) throw new Error("non autorizzato (HTTP 401): credenziali di scrittura mancanti o errate");
@@ -198,6 +219,15 @@ export async function wfsTransaction(gsUrl: string, kc: Keycloak | null, xml: st
     throw new Error(m?.[1]?.trim() || "transazione rifiutata da GeoServer");
   }
   if (!/<(?:\w+:)?SUCCESS/.test(body)) throw new Error("risposta inattesa da GeoServer");
+  return insertedIds(body);
+}
+
+/** fid degli oggetti inseriti in una risposta WFS-T 1.0 (GeoServer scrive fid="none" se non ci sono inserimenti). */
+export function insertedIds(body: string): string[] {
+  const out: string[] = [];
+  for (const block of body.match(/<(?:\w+:)?InsertResult\b[\s\S]*?<\/(?:\w+:)?InsertResult>/g) ?? [])
+    for (const m of block.matchAll(/<(?:\w+:)?FeatureId\s+fid="([^"]*)"/g)) if (m[1] && m[1] !== "none") out.push(m[1]);
+  return out;
 }
 
 /** Legenda di un layer (nello stile scelto). Per i raster con ColorMap GeoServer disegna la rampa con le etichette dei valori. */

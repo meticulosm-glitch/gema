@@ -1,7 +1,7 @@
 replicaCount: 1
 
 image:
-  repository: registy.gema.example.it
+  repository: registry.gema.example.it
   tag: "dev"
   pullPolicy: Always
 imagePullSecrets: 
@@ -25,8 +25,8 @@ env:
     value: mykeycloak-viewer
   - name: CONFIG_WORKSPACE
     value: geolibre-workspace 
-  - name: GEOSERVER_WRITE_PASSTHROUGH
-    value: "false"
+  - name: GEOSERVER_WRITE_PASSTHROUGH   # le scritture usano il token dell'utente: GeoServer (plugin OIDC) decide chi scrive
+    value: "true"
   - name: LOGO_URL
     value: "/logos/gema-logo-header.svg"
   - name: APP_TITLE
@@ -46,14 +46,16 @@ env:
 service:
   type: ClusterIP
   port: 80
-  targetPort: 8080       
+  targetPort: 8080       # nginx; con auth.enabled il Service punta invece a oauth2-proxy (4180)
 
 auth:
   enabled: false
   image: quay.io/oauth2-proxy/oauth2-proxy:v7.9.0
+  issuerUrl: ""          # obbligatorio con enabled: https://<keycloak>/realms/<realm>
   clientId: myclient
   clientRole: mykeycloak-role
   existingSecret: gema-oidc
+  createSecret: true     # crea existingSecret da Vault (OIDC_CLIENT_SECRET, OAUTH2_PROXY_COOKIE_SECRET); false se esiste già
   resources:
     requests: { cpu: 25m, memory: 32Mi }
     limits:   { cpu: 200m, memory: 128Mi }
@@ -69,15 +71,44 @@ eso:
   secretStoreName: existingsecretstore
   path: vaultpath/gema/secret
   existingSecret: gema-secret
-  secrets: 
-    - OAUTH2_PROXY_COOKIE_SECRET
-    - OIDC_CLIENT_SECRET
-    - GEOSERVER_PASSWORD
-    - GEOSERVER_USER
+  # variabili d'ambiente dell'app prese da Vault: "NOME" (stessa proprietà in Vault) oppure {key: NOME, property: proprietà}
+  secrets:
+    - key: GEOSERVER_USER              # credenziali di LETTURA che nginx aggiunge verso GeoServer:
+      property: GEOSERVER_READ_USER    # un utente di sola lettura, non l'amministratore (che resta solo al Job)
+    - key: GEOSERVER_PASSWORD
+      property: GEOSERVER_READ_PASSWORD
 
 postgres: 
   host: postgres.svc.cluster.local
 
+# Job di inizializzazione (tabelle in PostgreSQL, pubblicazione e regole dati in GeoServer)
+configJob:
+  geoserverUrl: http://mapp-enterprise-lot1-geoserver/geoserver   # URL interno per la REST API di GeoServer
+  aclReadRoles: ""         # vuoto = ROLE_ + VIEWER_ROLE, ADMIN_ROLE e KNOWN_ROLES dell'app (maiuscolo), separati da virgola
+  aclWriteRoles: ""        # vuoto = ROLE_ + ADMIN_ROLE
+  aclViewsWriteRoles: ""   # vuoto = come aclReadRoles (chi salva viste)
+
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+# Registro modifiche delle tabelle di configurazione: giorni da conservare (0 = per sempre). Lo applica il Job a ogni esecuzione.
+changeLogDays: 0
+
+# Statistiche d'uso: giorni di eventi da conservare (0 = per sempre). La raccolta si regola con USAGE_STATS nell'env dell'app
+# (off | anonymous | named; default anonymous: nessun nome utente, solo ruoli e sessione).
+usageDays: 180
+
+# Cache dei tile di nginx (env TILE_CACHE=true, TILE_CACHE_TTL, TILE_CACHE_SIZE): spazio del volume /tmp/nginx-tiles.
+# TILE_CACHE_SIZE deve restare sotto questo limite.
+tileCacheSizeLimit: 2Gi
+
+# Sicurezza del server web e segnalazione degli errori del browser (variabili d'ambiente dell'app, in env):
+#   CSP                  enforce (default) | report-only | off. Consente solo questo sito più le origini che compaiono nella
+#                        configurazione (Keycloak, sfondi, rilievo, loghi). Servizi esterni non in configurazione: CSP_EXTRA_ORIGINS.
+#                        Per una prima messa in produzione con servizi esterni non censiti: report-only, poi enforce.
+#   FRAME_ANCESTORS      siti che possono incorporare l'app in un iframe (default nessuno)
+#   CLIENT_ERRORS        true (default): errori JavaScript del browser e violazioni CSP nel log JSON di nginx
+#                        ({app="gema-web"} | json | type="client-error"), pronti per Loki
+#   RATE_LIMIT           true (default): limite per client verso GeoServer, poi 429. GEOSERVER_RATE (100r/s), GEOSERVER_BURST (600),
+#                        GEOSERVER_WRITE_RATE (10r/s), GEOSERVER_WRITE_BURST (40). Il client è X-Forwarded-For (APISIX, oauth2-proxy).

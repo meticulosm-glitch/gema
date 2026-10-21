@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { installDom } from "./dom";
-import { describeLayer, describeTable, getFeatureInfo, getWfsFeatureById, getWfsFeatures, wfsTransaction, wmsTileUrl } from "../src/api";
+import { describeLayer, describeTable, getFeatureInfo, getWfsFeatureById, getWfsFeatures, insertedIds, wfsTransaction, wmsTileUrl } from "../src/api";
 
 installDom();
 
@@ -131,11 +131,18 @@ describe("wfsTransaction", () => {
 
   it("accetta SUCCESS", async () => {
     const calls = mockFetch(() => ({ body: ok }));
-    await expect(wfsTransaction("http://gs", { token: "t" } as never, "<xml/>")).resolves.toBeUndefined();
+    await expect(wfsTransaction("http://gs", { token: "t" } as never, "<xml/>")).resolves.toEqual([]);
     expect(calls[0].url).toBe("http://gs/wfs");
     expect(calls[0].init?.method).toBe("POST");
     expect(calls[0].init?.body).toBe("<xml/>");
     expect(calls[0].init?.headers).toMatchObject({ "Content-Type": "text/xml", Authorization: "Bearer t" });
+  });
+
+  it("restituisce gli id degli oggetti inseriti (InsertResult); 'none' non conta", async () => {
+    mockFetch(() => ({ body: `<wfs:WFS_TransactionResponse xmlns:wfs="w" xmlns:ogc="o"><wfs:InsertResult><ogc:FeatureId fid="dashboards.12"/><ogc:FeatureId fid="dashboards.13"/></wfs:InsertResult><wfs:TransactionResult><wfs:Status><wfs:SUCCESS/></wfs:Status></wfs:TransactionResult></wfs:WFS_TransactionResponse>` }));
+    await expect(wfsTransaction("http://gs", null, "<xml/>")).resolves.toEqual(["dashboards.12", "dashboards.13"]);
+    expect(insertedIds(`<wfs:InsertResult><ogc:FeatureId fid="none"/></wfs:InsertResult>`)).toEqual([]);
+    expect(insertedIds(`<InsertResult><FeatureId fid="a.1"/></InsertResult><FeatureId fid="fuori"/>`)).toEqual(["a.1"]);
   });
 
   it("traduce 401, 403, eccezioni OGC e transazioni fallite", async () => {
@@ -159,5 +166,16 @@ describe("wfsTransaction", () => {
 
     mockFetch(() => ({ status: 200, body: "<ok/>" }));
     await expect(wfsTransaction("http://gs", null, "<xml/>")).rejects.toThrow(/inattesa/);
+  });
+});
+
+describe("wmsTileUrl: GeoWebCache (WMS_TILED)", () => {
+  it("tiled=true solo se attivo", async () => {
+    const { setWmsTiled } = await import("../src/api");
+    expect(wmsTileUrl("/gs", "ws:a")).not.toContain("tiled=true");
+    setWmsTiled(true);
+    expect(wmsTileUrl("/gs", "ws:a", { cql: "a = 1" }, 3)).toMatch(/&height=256&tiled=true&cql_filter=a%20%3D%201&_r=3&bbox=\{bbox-epsg-3857\}$/);
+    setWmsTiled(false);
+    expect(wmsTileUrl("/gs", "ws:a")).not.toContain("tiled");
   });
 });

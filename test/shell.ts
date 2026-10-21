@@ -13,6 +13,12 @@ export interface ScriptResult {
   proxyConf: string | null;
   authMap: string | null;
   geocodeMap: string | null;
+  logMap: string | null;
+  tilesMap: string | null;
+  rateMap: string | null;
+  securityInc: string | null;
+  securityMap: string | null;
+  securityConf: string | null;
   configJson: string | null;
 }
 
@@ -66,6 +72,12 @@ export async function runEntrypoint(
     proxyConf: await read(join(proxyDir, "proxy.conf")),
     authMap: await read(join(proxyDir, "auth.map")),
     geocodeMap: await read(join(proxyDir, "geocode.map")),
+    logMap: await read(join(proxyDir, "log.map")),
+    tilesMap: await read(join(proxyDir, "tiles.map")),
+    rateMap: await read(join(proxyDir, "rate.map")),
+    securityInc: await read(join(proxyDir, "security.inc")),
+    securityMap: await read(join(proxyDir, "security.map")),
+    securityConf: await read(join(proxyDir, "security.conf")),
     configJson: await read(confPath),
   };
   await rm(dir, { recursive: true, force: true });
