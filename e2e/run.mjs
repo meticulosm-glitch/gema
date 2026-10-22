@@ -9,7 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { E2E, MOCK, RUN, prepare, sleep } from "./lib.mjs";
 
-const ALL = ["e2e", "e2e-access", "e2e-search", "e2e-download", "e2e-catalog", "e2e-roleview", "e2e-forms", "e2e-announce", "e2e-dashio", "e2e-widgets", "e2e-filters", "e2e-drafts", "e2e-viewas", "e2e-diag", "e2e-changes", "e2e-usage", "e2e-backup", "e2e-tiles", "e2e-vectortiles", "e2e-security"];
+const ALL = ["e2e", "e2e-access", "e2e-search", "e2e-download", "e2e-catalog", "e2e-roleview", "e2e-forms", "e2e-announce", "e2e-dashio", "e2e-widgets", "e2e-filters", "e2e-drafts", "e2e-viewas", "e2e-diag", "e2e-changes", "e2e-usage", "e2e-backup", "e2e-tiles", "e2e-vectortiles", "e2e-security", "e2e-metrics"];
 const chosen = process.argv.slice(2).map((s) => s.replace(/\.mjs$/, ""));
 const scenarios = chosen.length ? chosen : ALL;
 for (const s of scenarios) if (!ALL.includes(s)) { console.error(`scenario sconosciuto: ${s} (disponibili: ${ALL.join(", ")})`); process.exit(2); }

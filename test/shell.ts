@@ -19,6 +19,10 @@ export interface ScriptResult {
   securityInc: string | null;
   securityMap: string | null;
   securityConf: string | null;
+  metricsMain: string | null;
+  metricsMap: string | null;
+  metricsInc: string | null;
+  metricsConf: string | null;
   configJson: string | null;
 }
 
@@ -26,7 +30,7 @@ export interface ScriptResult {
 export async function runEntrypoint(
   scriptName: string,
   env: Record<string, string> = {},
-  opts: { preexistingConfig?: string } = {},
+  opts: { preexistingConfig?: string; njsModule?: boolean } = {},
 ): Promise<ScriptResult> {
   const dir = await mkdtemp(join(tmpdir(), "mapp-entrypoint-"));
   const proxyDir = join(dir, "proxy.d");
@@ -40,6 +44,11 @@ export async function runEntrypoint(
   let src = await readFile(srcPath, "utf8");
   src = src.replace("DIR=/etc/nginx/proxy.d", `DIR=${proxyDir}`);
   src = src.replace("CONF=/usr/share/nginx/html/config.json", `CONF=${confPath}`);
+  // modulo njs e script delle metriche: file finti, presenti salvo njsModule: false (come in un nginx senza njs)
+  const njsModule = join(dir, "ngx_http_js_module.so");
+  if (opts.njsModule !== false) await writeFile(njsModule, "");
+  src = src.replace("MODULE=/etc/nginx/modules/ngx_http_js_module.so", `MODULE=${njsModule}`);
+  src = src.replace("NJS=/etc/nginx/njs/metrics.js", `NJS=${new URL("../nginx/metrics.js", import.meta.url).pathname}`);
   const scriptPath = join(dir, "run.sh");
   await writeFile(scriptPath, src, { mode: 0o755 });
 
@@ -78,6 +87,10 @@ export async function runEntrypoint(
     securityInc: await read(join(proxyDir, "security.inc")),
     securityMap: await read(join(proxyDir, "security.map")),
     securityConf: await read(join(proxyDir, "security.conf")),
+    metricsMain: await read(join(proxyDir, "metrics.main")),
+    metricsMap: await read(join(proxyDir, "metrics.map")),
+    metricsInc: await read(join(proxyDir, "metrics.inc")),
+    metricsConf: await read(join(proxyDir, "metrics.conf")),
     configJson: await read(confPath),
   };
   await rm(dir, { recursive: true, force: true });

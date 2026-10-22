@@ -85,7 +85,17 @@ export function prepare() {
   stopStale();
 }
 
+/**
+ * Modulo njs di nginx su questa macchina (serve alle metriche di 50-metrics-config.sh), oppure null.
+ * NGINX_JS_MODULE per indicarne uno in un percorso diverso.
+ */
+export const NJS_MODULE = [process.env.NGINX_JS_MODULE, "/usr/lib/nginx/modules/ngx_http_js_module.so", "/etc/nginx/modules/ngx_http_js_module.so",
+  "/usr/lib64/nginx/modules/ngx_http_js_module.so", "/usr/local/lib/nginx/modules/ngx_http_js_module.so", "/opt/homebrew/lib/nginx/modules/ngx_http_js_module.so"]
+  .find((f) => f && fs.existsSync(f)) ?? null;
+
 const sub = (d) => (s) => s
+  .replaceAll("/etc/nginx/modules/ngx_http_js_module.so", NJS_MODULE ?? `${d}/njs-mancante.so`)
+  .replaceAll("/etc/nginx/njs/metrics.js", path.join(ROOT, "nginx/metrics.js"))
   .replaceAll("/etc/nginx/proxy.d", `${d}/proxy.d`)
   .replaceAll("/usr/share/nginx/html", `${d}/html`)
   .replaceAll("/tmp/nginx-geocode", `${d}/tmp/geocode`)
@@ -108,9 +118,11 @@ export function runtimeConfig(env) {
 
 /**
  * Avvia nginx su 127.0.0.1:`port` con la build in dist/ e la configurazione generata dagli script di entrypoint
- * (35-proxy-config.sh, 40-runtime-config.sh, 45-security-config.sh) e da nginx/default.conf, come nell'immagine.
+ * (35-proxy-config.sh, 40-runtime-config.sh, 45-security-config.sh, 50-metrics-config.sh) e da nginx/default.conf, come
+ * nell'immagine. Le metriche restano sulla porta METRICS_PORT data in `env` (default 127.0.0.1:`port`+1000); senza il
+ * modulo njs lo script le spegne. `opts.workers`: numero di worker di nginx (default 1).
  */
-export function startNginx(name, port, env) {
+export function startNginx(name, port, env, opts = {}) {
   const d = path.join(RUN, name);
   const old = path.join(d, "nginx.pid");
   if (fs.existsSync(old)) { try { process.kill(Number(fs.readFileSync(old, "utf8").trim())); } catch { /* già fermo */ } }
@@ -119,9 +131,10 @@ export function startNginx(name, port, env) {
   fs.cpSync(path.join(ROOT, "dist"), path.join(d, "html"), { recursive: true });
   fs.rmSync(path.join(d, "html/config.json"), { force: true });
   const s = sub(d);
-  for (const sc of ["35-proxy-config.sh", "40-runtime-config.sh", "45-security-config.sh"]) {
+  const scriptEnv = { PATH: process.env.PATH, METRICS_PORT: `127.0.0.1:${port + 1000}`, ...env };
+  for (const sc of ["35-proxy-config.sh", "40-runtime-config.sh", "45-security-config.sh", "50-metrics-config.sh"]) {
     fs.writeFileSync(path.join(d, sc), s(fs.readFileSync(path.join(ROOT, "docker-entrypoint.d", sc), "utf8")));
-    execSync(`sh ${path.join(d, sc)}`, { env: { PATH: process.env.PATH, ...env }, encoding: "utf8" });
+    execSync(`sh ${path.join(d, sc)}`, { env: scriptEnv, encoding: "utf8" });
   }
   const conf = s(fs.readFileSync(path.join(ROOT, "nginx/default.conf"), "utf8"))
     .replace("listen 8080", `listen 127.0.0.1:${port}`)
@@ -131,7 +144,7 @@ export function startNginx(name, port, env) {
   const asRoot = typeof process.getuid === "function" && process.getuid() === 0;
   fs.writeFileSync(
     path.join(d, "nginx.conf"),
-    `${asRoot ? "user root;\n" : ""}pid ${d}/nginx.pid;\nerror_log ${d}/error.log;\nevents {}\nhttp {\n${mime ? ` include ${mime};\n` : ""}` +
+    `include ${d}/proxy.d/*.main;\n${opts.workers ? `worker_processes ${opts.workers};\n` : ""}${asRoot ? "user root;\n" : ""}pid ${d}/nginx.pid;\nerror_log ${d}/error.log;\nevents {}\nhttp {\n${mime ? ` include ${mime};\n` : ""}` +
       ` client_body_temp_path ${d}/tmp/b; proxy_temp_path ${d}/tmp/p; fastcgi_temp_path ${d}/tmp/f; uwsgi_temp_path ${d}/tmp/u; scgi_temp_path ${d}/tmp/s;\n` +
       ` include ${d}/default.conf;\n}\n`,
   );
@@ -140,6 +153,8 @@ export function startNginx(name, port, env) {
   const inst = {
     d,
     url: `http://127.0.0.1:${port}`,
+    /** server delle metriche (vuoto se spente) */
+    metricsUrl: fs.readFileSync(path.join(d, "proxy.d/metrics.map"), "utf8").trim() ? `http://${/^[\d.]+:/.test(scriptEnv.METRICS_PORT) ? "" : "127.0.0.1:"}${scriptEnv.METRICS_PORT}` : "",
     stop: () => {
       try { process.kill(Number(fs.readFileSync(path.join(d, "nginx.pid"), "utf8").trim())); } catch { /* già fermo */ }
     },

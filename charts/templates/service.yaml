@@ -13,3 +13,9 @@ spec:
       port: {{ .Values.service.port }}
       # con oauth2-proxy il traffico passa prima dal login (porta 4180), altrimenti va direttamente a nginx
       targetPort: {{ if .Values.auth.enabled }}4180{{ else }}{{ .Values.service.targetPort }}{{ end }}
+  {{- if .Values.metrics.enabled }}
+    # /metrics di nginx per Prometheus: solo dentro al cluster (la rotta APISIX usa la porta http)
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+  {{- end }}

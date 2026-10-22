@@ -13,6 +13,12 @@ spec:
     metadata:
       labels:
         {{- include "geolibre.selectorLabels" . | nindent 8 }}
+      {{- if and .Values.metrics.enabled .Values.metrics.podAnnotations }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.metrics.port | quote }}
+        prometheus.io/path: /metrics
+      {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -28,7 +34,14 @@ spec:
           ports:
             - name: http
               containerPort: 8080          # nginx-unprivileged
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}   # /metrics per Prometheus (50-metrics-config.sh)
+            {{- end }}
           {{- $envVars := dict }}
+          {{- /* metriche dai values del chart; una variabile con lo stesso nome in env o extraEnv vince */}}
+          {{- $_ := set $envVars "METRICS" (dict "name" "METRICS" "value" (ternary "true" "false" (.Values.metrics.enabled | default false))) }}
+          {{- $_ := set $envVars "METRICS_PORT" (dict "name" "METRICS_PORT" "value" (.Values.metrics.port | toString)) }}
           {{- range .Values.env }}
             {{- $_ := set $envVars .name . }}
           {{- end }}

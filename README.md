@@ -52,7 +52,7 @@ Si installa con il chart Helm in [`charts/`](charts/README.md), che descrive tut
     │                                                         ├─► /geocode/    ──► Nominatim / Photon
     │                                                         ├─► /api/        ──► backend opzionale
     │                                                         └─► /client-errors, /csp-report ──► log JSON (Loki)
-    └──── login ──► Keycloak (token OIDC, ruoli)
+    └──── login ──► Keycloak (token OIDC, ruoli)                  nginx :9145/metrics ◄── Prometheus (solo nel cluster)
 ```
 
 - **nginx** serve l'app e fa da reverse proxy: aggiunge le credenziali di GeoServer (il browser non le vede), tiene il
@@ -60,7 +60,8 @@ Si installa con il chart Helm in [`charts/`](charts/README.md), che descrive tut
   log in testo o JSON.
 - **La configurazione di nginx e dell'app nasce all'avvio** dagli script in `docker-entrypoint.d/`, a partire dalle
   variabili d'ambiente: `35-proxy-config.sh` (proxy, credenziali, cache, limiti, log), `40-runtime-config.sh`
-  (`config.json` letto dal browser), `45-security-config.sh` (CSP, intestazioni di sicurezza, segnalazioni dal browser).
+  (`config.json` letto dal browser), `45-security-config.sh` (CSP, intestazioni di sicurezza, segnalazioni dal browser),
+  `50-metrics-config.sh` (metriche per Prometheus).
 - **Un Job Helm** crea in PostgreSQL lo schema `gema_config` e pubblica le tabelle in GeoServer con le regole di accesso.
   È idempotente: gira a ogni sync di ArgoCD e non tocca ciò che esiste già.
 
@@ -178,6 +179,10 @@ Se una tabella di configurazione manca (Job non ancora rieseguito), l'app funzio
 - **Errori del browser nel log:** gli errori JavaScript e le violazioni della CSP arrivano a nginx e finiscono nel log JSON
   (`type="client-error"`, `type="csp-violation"`), con pila, versione della build e pagina, senza token né dati della vista.
 - **Statistiche d'uso** in PostGIS, anonime di default.
+- **Metriche per Prometheus** su `/metrics`, porta 9145 (solo dentro al cluster: la rotta APISIX non la espone):
+  richieste per area e stato, istogrammi dei tempi di risposta (intera richiesta, GeoServer per tipo di richiesta OGC,
+  upstream), cache dei tile, richieste respinte dai limiti, connessioni di nginx. ServiceMonitor per il Prometheus Operator
+  nel chart. Elenco ed esempi PromQL in [`charts/README.md`](charts/README.md#metriche-per-prometheus).
 - **Pagina di diagnostica** e `/healthz` per i probe di Kubernetes.
 
 Esempi LogQL:
@@ -186,6 +191,13 @@ Esempi LogQL:
 {app="gema-web"} | json | type="client-error"
 topk(10, sum by (layers) (count_over_time({app="gema-web"} | json | request="GetMap" [24h])))
 sum by (status) (count_over_time({app="gema-web"} | json | path=~"/geoserver/.*" | status>=500 [1h]))
+```
+
+Esempi PromQL:
+
+```promql
+histogram_quantile(0.95, sum by (le) (rate(gema_geoserver_request_duration_seconds_bucket{request="GetMap"}[5m])))
+sum by (request) (rate(gema_geoserver_requests_total{status=~"5.."}[5m]))
 ```
 
 ## Configurazione
@@ -221,16 +233,16 @@ docker run --rm -p 8080:8080 \
   gema-web
 ```
 
-L'immagine è basata su `nginx-unprivileged` (utente non root, porta 8080) e contiene la build dell'app, `nginx/default.conf`
-e gli script di avvio.
+L'immagine è basata su `nginx-unprivileged` (utente non root, porta 8080; metriche sulla 9145) e contiene la build
+dell'app, `nginx/default.conf`, il modulo njs delle metriche (`nginx/metrics.js`) e gli script di avvio.
 
 ## Test
 
 | Tipo | Comando | Cosa serve |
 |---|---|---|
 | Unitari | `npm test` | niente |
-| Integrazione | `npm run test:integration:docker` | Docker con compose, `psql`, nginx: PostGIS e GeoServer reali ([dettagli](test/integration/README.md)) |
-| End-to-end | `npm run test:e2e` | nginx e Chromium di Playwright: browser vero, GeoServer e Keycloak simulati ([dettagli](e2e/README.md)) |
+| Integrazione | `npm run test:integration:docker` | Docker con compose, `psql`, nginx con il modulo njs: PostGIS e GeoServer reali ([dettagli](test/integration/README.md)) |
+| End-to-end | `npm run test:e2e` | nginx (con il modulo njs, per le metriche) e Chromium di Playwright: browser vero, GeoServer e Keycloak simulati ([dettagli](e2e/README.md)) |
 | Tutti | `npm run test:all` | tutto quanto sopra |
 
 ## Struttura del repository
@@ -239,7 +251,8 @@ e gli script di avvio.
 src/                    applicazione (React + TypeScript)
 public/                 file statici: loghi, favicon, config.json di sviluppo
 nginx/default.conf      server nginx (include la configurazione generata all'avvio)
-docker-entrypoint.d/    script di avvio che generano proxy, config.json e sicurezza
+nginx/metrics.js        metriche per Prometheus (modulo njs)
+docker-entrypoint.d/    script di avvio che generano proxy, config.json, sicurezza e metriche
 docker/Dockerfile       immagine di produzione
 charts/                 chart Helm: app, rotta APISIX, secret, Job di inizializzazione
 test/                   test unitari; test/integration/ test con servizi reali

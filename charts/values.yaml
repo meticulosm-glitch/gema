@@ -63,6 +63,19 @@ auth:
 apisixRoute:
   enabled: true
 
+# Metriche per Prometheus: nginx espone /metrics su una porta separata (metrics.port), nel Service ma non nella rotta APISIX,
+# quindi raggiungibile solo dentro al cluster. Richieste, stati, byte e tempi di risposta (istogrammi), GeoServer per tipo
+# di richiesta OGC, cache dei tile, connessioni. Elenco delle metriche ed esempi PromQL in charts/README.md.
+metrics:
+  enabled: true            # false = METRICS=false nel container e nessuna porta metrics
+  port: 9145
+  podAnnotations: false    # true = annotazioni prometheus.io/scrape, /port, /path sul pod (Prometheus senza Operator)
+  serviceMonitor:
+    enabled: false         # ServiceMonitor per il Prometheus Operator (kube-prometheus-stack)
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}             # etichette richieste dal selettore di Prometheus, es. release: kube-prometheus-stack
+
 resources:
   requests: { cpu: 100m, memory: 256Mi }
   limits:   { cpu: "1", memory: 1Gi }

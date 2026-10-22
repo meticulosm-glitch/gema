@@ -1,7 +1,8 @@
 # Test end-to-end
 
 Browser reale (Chromium di Playwright) e nginx reale, configurato dagli stessi script di entrypoint dell'immagine
-(`docker-entrypoint.d/35-proxy-config.sh`, `40-runtime-config.sh`) e da `nginx/default.conf`. GeoServer, Keycloak e i
+(`docker-entrypoint.d/35-proxy-config.sh`, `40-runtime-config.sh`, `45-security-config.sh`, `50-metrics-config.sh`) e da
+`nginx/default.conf`, con le metriche attive come nell'immagine se c'è il modulo njs. GeoServer, Keycloak e i
 geocoder sono simulati da `mock-gs.mjs`, così gli scenari non dipendono da servizi esterni.
 
 | Scenario | Cosa copre |
@@ -12,6 +13,7 @@ geocoder sono simulati da `mock-gs.mjs`, così gli scenari non dipendono da serv
 | `e2e-tiles.mjs` | cache dei tile WMS in nginx: HIT/MISS, cosa non va in cache (eccezioni, FeatureInfo, WFS), cookie e header, richieste parallele, tempi, cache condivisa tra due utenti nel browser |
 | `e2e-vectortiles.mjs` | disegno vettoriale (vector tiles): scelta Immagine/Vettoriale se GeoServer offre MVT, tile MVT, oggetto e attributi al passaggio del mouse senza GetFeatureInfo, legenda col colore, filtro applicato ai tile, scelta ricordata nel link, ritorno all'immagine, GeoServer senza estensione |
 | `e2e-security.mjs` | sicurezza di nginx: CSP, X-Frame-Options, nosniff, Referrer-Policy, Permissions-Policy su tutte le risposte (anche index.html, config.json, asset, GeoServer); app funzionante con la CSP applicata; script inline iniettato bloccato e violazione nel log; errori JavaScript e promesse rifiutate nel log JSON (pila, versione, token oscurato, solo il percorso della pagina), ripetizioni contate una volta; 429 su raffiche di segnalazioni, letture e scritture verso GeoServer; corpo oltre 16 kB 413; `CSP=report-only`, `FRAME_ANCESTORS`, `CLIENT_ERRORS=false`. Tutti gli scenari girano con la CSP applicata, quindi una violazione altrove fa fallire il controllo «nessun errore in console» |
+| `e2e-metrics.mjs` | metriche per Prometheus mentre si usa l'app: `/metrics` sulla porta dedicata in formato valido (mai su quella dell'app), pagine, configurazione, asset e richieste a GeoServer contate per area e per richiesta OGC (tile, Feature Info, dashboard); con GeoServer lento le GetMap stanno sopra 0.25 s nell'istogramma, quelle dalla cache di un secondo utente sotto 0.1 s; le chiamate a GeoServer misurate da nginx sono esattamente quelle ricevute; contatori che crescono soltanto e di quanto devono; connessioni; `METRICS=false`. Serve il modulo njs di nginx: senza, lo scenario si salta (`E2E_REQUIRE_NJS=1` lo rende un errore) |
 | `e2e-download.mjs` | scarico dei dati: GeoJSON, CSV e Shapefile (WFS) con filtro e area visibile, limite di oggetti, GeoTIFF (WCS) con ritaglio e data; i file scaricati vengono aperti e controllati |
 | `e2e-catalog.mjs` | catalogo prodotti da interfaccia: cartelle annidate, ordine (frecce e trascinamento), titoli e descrizioni, layer e cartelle nascosti, accesi di default; salvataggio in un'unica transazione WFS-T, layer nuovi e non più pubblicati, conflitto tra admin, errore a metà transazione, tabelle mancanti; cosa vede il visualizzatore |
 | `e2e-roleview.mjs` | vista iniziale per ruolo: area (numeri e mini-mappa), sfondo e layer accesi dalla pagina Ruoli; cosa vede chi apre la mappa con uno o più ruoli, con un link, da admin; pulsante area di interesse; vista svuotata ed eliminata; tabella mancante |
@@ -36,7 +38,9 @@ node e2e/run.mjs e2e-search # solo uno scenario (la build in dist/ deve esserci)
 ```
 
 Le dipendenze degli scenari (Playwright compreso) sono in `e2e/package.json`. La prima volta serve il browser: `npx --prefix e2e playwright install chromium`. Serve anche nginx (`apt-get install nginx`,
-`brew install nginx`); il servizio di sistema non viene toccato, i test avviano le proprie istanze su 127.0.0.1:8091-8099.
+`brew install nginx`) e, per le metriche, il suo modulo njs (`apt-get install libnginx-mod-http-js`; in un percorso diverso
+`NGINX_JS_MODULE=/percorso/ngx_http_js_module.so`); il servizio di sistema non viene toccato, i test avviano le proprie
+istanze su 127.0.0.1:8072-8099 e 8177-8178, con le metriche sulla porta + 1000.
 
 Screenshot, log di nginx e config generate finiscono in `e2e/.run` (ignorata da git; `E2E_RUN_DIR` per cambiarla).
 `CHROMIUM_PATH` usa un Chromium già installato al posto di quello di Playwright.

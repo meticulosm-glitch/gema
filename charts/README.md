@@ -29,6 +29,7 @@ rotta APISIX, i secret da Vault e il Job che prepara database e GeoServer. Le fu
   - [Limiti per client](#limiti-per-client)
   - [Sicurezza](#sicurezza)
   - [Log, errori e statistiche](#log-errori-e-statistiche)
+  - [Metriche per Prometheus](#metriche-per-prometheus)
 - [Job di inizializzazione](#job-di-inizializzazione)
 - [Esempio di values per un ambiente](#esempio-di-values-per-un-ambiente)
 - [Prerequisiti in GeoServer e Vault](#prerequisiti-in-geoserver-e-vault)
@@ -37,8 +38,9 @@ rotta APISIX, i secret da Vault e il Job che prepara database e GeoServer. Le fu
 
 | Risorsa | Template | Note |
 |---|---|---|
-| Deployment | `deployment.yaml` | container `geolibre` (nginx + app, porta 8080) e, con `auth.enabled`, il sidecar `oauth2-proxy` (porta 4180). Volumi `emptyDir`: `/data` e `/tmp/nginx-tiles` (cache dei tile) |
-| Service | `service.yaml` | porta `service.port` verso nginx (`service.targetPort`) oppure, con `auth.enabled`, verso oauth2-proxy (4180) |
+| Deployment | `deployment.yaml` | container `geolibre` (nginx + app, porta 8080; metriche sulla porta `metrics.port`) e, con `auth.enabled`, il sidecar `oauth2-proxy` (porta 4180). Volumi `emptyDir`: `/data` e `/tmp/nginx-tiles` (cache dei tile) |
+| Service | `service.yaml` | porta `service.port` verso nginx (`service.targetPort`) oppure, con `auth.enabled`, verso oauth2-proxy (4180); con `metrics.enabled` anche la porta `metrics` verso nginx |
+| ServiceMonitor | `servicemonitor.yaml` | raccolta di `/metrics` per il Prometheus Operator (solo con `metrics.serviceMonitor.enabled`) |
 | ApisixRoute | `apisixroute.yaml` | tutto il traffico di `apisixRoute.host` verso il Service (solo con `apisixRoute.enabled`) |
 | ExternalSecret | `external-secret.yaml` | secret `eso.existingSecret` con le chiavi `eso.secrets`, caricato nell'app con `envFrom` |
 | ExternalSecret | `auth-external-secret.yaml` | secret `auth.existingSecret` di oauth2-proxy (solo con `auth.enabled` e `auth.createSecret`) |
@@ -89,6 +91,10 @@ le due liste vengono unite per nome, e a parità di nome vince `extraEnv`.
 | `auth.resources` | 25m/32Mi, limiti 200m/128Mi | risorse del sidecar |
 | `apisixRoute.enabled` | `true` | crea la ApisixRoute |
 | `apisixRoute.host` | — | host pubblico dell'app (es. `gema.example.it`); con `auth.enabled` il redirect di oauth2-proxy è `https://<host>/oauth2/callback` |
+| `metrics.enabled` | `true` | metriche per Prometheus su `/metrics` (imposta `METRICS` e `METRICS_PORT` nel container, porta `metrics` nel pod e nel Service). La rotta APISIX non la espone: da fuori del cluster non si raggiunge ([dettagli](#metriche-per-prometheus)) |
+| `metrics.port` | `9145` | porta delle metriche (nel container e nel Service) |
+| `metrics.podAnnotations` | `false` | annotazioni `prometheus.io/scrape`, `prometheus.io/port`, `prometheus.io/path` sul pod, per un Prometheus che scopre i pod dalle annotazioni |
+| `metrics.serviceMonitor` | spento | ServiceMonitor del Prometheus Operator: `metrics.serviceMonitor.enabled` (`false`), `metrics.serviceMonitor.interval` (`30s`), `metrics.serviceMonitor.scrapeTimeout` (`10s`), `metrics.serviceMonitor.labels` (`{}`, le etichette che il selettore di Prometheus richiede, es. `release: kube-prometheus-stack`) |
 | `resources` | 100m/256Mi, limiti 1 CPU/1Gi | risorse del container dell'app |
 | `eso.secretStoreName` | `existingsecretstore` | ClusterSecretStore di External Secrets |
 | `eso.path` | `vaultpath/gema/secret` | percorso in Vault di tutti i secret |
@@ -126,7 +132,7 @@ Le variabili che finiscono in `config.json` non hanno effetto se `config.json` �
 `/usr/share/nginx/html/config.json`; quelle di nginx (proxy, cache, limiti, sicurezza) valgono sempre.
 
 Script che le leggono: **35** = `35-proxy-config.sh` (nginx: proxy e limiti), **40** = `40-runtime-config.sh`
-(`config.json`), **45** = `45-security-config.sh` (nginx: sicurezza).
+(`config.json`), **45** = `45-security-config.sh` (nginx: sicurezza), **50** = `50-metrics-config.sh` (nginx: metriche).
 
 ### Autenticazione e ruoli
 
@@ -252,6 +258,56 @@ Per un primo rilascio con servizi esterni non censiti conviene `CSP=report-only`
 | `CLIENT_ERRORS` | `true` | 40, 45 | il browser manda i propri errori JavaScript a `/client-errors` e nginx li scrive nel log JSON con `type="client-error"` (messaggio, pila, pagina, versione; token oscurati). `false` spegne l'endpoint e l'invio |
 | `USAGE_STATS` | `anonymous` | 40 | statistiche d'uso (con `ACCESS_CONTROL`): `off`, `anonymous` (ruoli e sessione, nessun nome) oppure `named` (anche il nome utente) |
 
+### Metriche per Prometheus
+
+| Variabile | Default | Script | Descrizione |
+|---|---|---|---|
+| `METRICS` | `true` | 50 | metriche per Prometheus su `GET /metrics`, su una porta separata da quella dell'app. Il chart la imposta da `metrics.enabled` |
+| `METRICS_PORT` | `9145` | 50 | porta delle metriche (anche `indirizzo:porta`); non può essere 8080. Il chart la imposta da `metrics.port` |
+
+nginx registra ogni richiesta conclusa in una memoria condivisa tra i worker (modulo njs dell'immagine, `nginx/metrics.js`) e
+la espone nel formato testuale di Prometheus. Sulla porta dell'app `/metrics` risponde 404; la porta delle metriche è nel
+Service ma non nella rotta APISIX, quindi la leggono solo i client dentro al cluster (Prometheus). I contatori ripartono da
+zero quando il pod si riavvia (Prometheus lo gestisce con `rate()`), non con un reload di nginx.
+
+| Metrica | Tipo | Etichette | Cosa misura |
+|---|---|---|---|
+| `gema_http_requests_total` | counter | `route`, `method`, `status` | richieste per area (`app`, `assets`, `config`, `static`, `geoserver`, `geocode`, `api`), metodo e stato; `status="429"` = respinte dai limiti per client |
+| `gema_http_request_duration_seconds` | histogram | `route` | durata delle richieste, dal primo byte ricevuto all'ultimo inviato (bucket da 5 ms a 60 s) |
+| `gema_http_response_bytes_total` | counter | `route` | byte inviati ai client |
+| `gema_upstream_response_duration_seconds` | histogram | `route` | tempo di risposta di GeoServer, geocoder e backend; esclusi i tile dalla cache e le richieste respinte da nginx |
+| `gema_geoserver_requests_total` | counter | `request`, `status` | richieste verso GeoServer per tipo: `GetMap`, `GetFeatureInfo`, `GetLegendGraphic`, `GetCapabilities`, `GetFeature`, `DescribeFeatureType`, `GetPropertyValue`, `Transaction` (le POST WFS-T), `GetCoverage`, `DescribeCoverage`, `GetTile`, `gwc` (GeoWebCache), `other` |
+| `gema_geoserver_request_duration_seconds` | histogram | `request` | durata per tipo di richiesta OGC, come la vede il browser (cache compresa) |
+| `gema_tile_cache_requests_total` | counter | `status` | esiti della cache dei tile (`HIT`, `MISS`, `BYPASS`, `EXPIRED`, `STALE`, `UPDATING`, `REVALIDATED`) |
+| `gema_nginx_connections` | gauge | `state` | connessioni aperte ora (`active`, `reading`, `writing`, `waiting`) |
+| `gema_nginx_connections_accepted_total`, `gema_nginx_connections_handled_total`, `gema_nginx_requests_total` | counter | — | connessioni e richieste di nginx dall'avvio (comprese sonde e metriche) |
+| `gema_metrics_zone_free_bytes`, `gema_metrics_zone_size_bytes` | gauge | — | spazio della memoria condivisa delle metriche (4 MB, ne bastano poche decine di kB) |
+
+Le etichette hanno solo valori da insiemi chiusi (mai percorsi, layer o utenti), così le serie restano poche; il dettaglio
+per layer resta nel log JSON (`ACCESS_LOG_FORMAT=json`, Loki). Con più repliche ogni pod ha le sue metriche: si sommano
+con `sum by (...)`.
+
+Esempi PromQL:
+
+```promql
+# tempo al 95° percentile delle GetMap, negli ultimi 5 minuti
+histogram_quantile(0.95, sum by (le) (rate(gema_geoserver_request_duration_seconds_bucket{request="GetMap"}[5m])))
+# tempo medio di risposta di GeoServer
+sum(rate(gema_upstream_response_duration_seconds_sum{route="geoserver"}[5m])) / sum(rate(gema_upstream_response_duration_seconds_count{route="geoserver"}[5m]))
+# quota di richieste servite in meno di 1 s (obiettivo di servizio)
+sum(rate(gema_http_request_duration_seconds_bucket{route="geoserver",le="1"}[5m])) / sum(rate(gema_http_request_duration_seconds_count{route="geoserver"}[5m]))
+# errori di GeoServer al secondo, per tipo di richiesta
+sum by (request) (rate(gema_geoserver_requests_total{status=~"5.."}[5m]))
+# richieste respinte dai limiti per client
+sum(rate(gema_http_requests_total{status="429"}[5m]))
+# quota di tile dalla cache
+sum(rate(gema_tile_cache_requests_total{status="HIT"}[5m])) / sum(rate(gema_tile_cache_requests_total[5m]))
+```
+
+Per farle raccogliere: con il Prometheus Operator `metrics.serviceMonitor.enabled: true` (più le etichette che il suo
+selettore richiede in `metrics.serviceMonitor.labels`); con un Prometheus che legge le annotazioni dei pod
+`metrics.podAnnotations: true`.
+
 ## Job di inizializzazione
 
 Il Job `<rilascio>-geolibre-config-init` gira a ogni sync di ArgoCD (hook `Sync`, il precedente viene eliminato) ed è idempotente.
@@ -336,6 +392,11 @@ extraEnv:
     value: it
   - name: CSP
     value: report-only        # poi enforce, dopo aver controllato le violazioni nel log
+metrics:
+  serviceMonitor:
+    enabled: true
+    labels:
+      release: kube-prometheus-stack
 configJob:
   geoserverUrl: http://geoserver.gema-prod.svc.cluster.local:8080/geoserver
 changeLogDays: 365

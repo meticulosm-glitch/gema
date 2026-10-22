@@ -21,6 +21,7 @@ Verificano i pezzi che i test unitari e gli e2e (con GeoServer finto) non posson
 | `backup.int.test.ts` | GeoServer + PostGIS | backup e ripristino: configurazione letta ed esportata, cambiata, poi ripristinata in un'unica transazione (sostituzione); dopo il ripristino ogni sezione è identica al backup |
 | `vectortiles.int.test.ts` | GeoServer + PostGIS | conteggio esatto (resultType=hits) di un layer oltre il limite dei widget; se GeoServer ha l'estensione vectortiles, GetMap in MVT con layer e attributi letti dal tile |
 | `security.int.test.ts` | nginx | configurazione generata da 35/40/45 + `default.conf` con nginx vero: ogni combinazione di CSP, `CLIENT_ERRORS`, `RATE_LIMIT`, cache e geocoder passa `nginx -t`; intestazioni di sicurezza su ogni location; segnalazione del browser nel log JSON con il corpo intatto, senza cookie né token, senza toccare l'upstream; 429 oltre il limite per client (letture e scritture) e l'upstream vede solo le richieste ammesse |
+| `metrics.int.test.ts` | nginx con njs (+ GeoServer) | metriche per Prometheus con nginx vero: ogni combinazione di configurazione passa `nginx -t`; conteggi esatti per area, metodo, stato e richiesta OGC; tempi nei bucket giusti con un upstream dai ritardi noti; tempo dell'upstream solo quando ha risposto (non per i tile dalla cache né per i 429); contatori condivisi tra 4 worker, che crescono esattamente e restano dopo un reload; `/metrics` solo sulla porta dedicata; `METRICS=false`; con GeoServer: capabilities e GetMap misurate |
 | `tiles.int.test.ts` | GeoServer + PostGIS + nginx | cache dei tile davanti a GeoServer vero: HIT/MISS su un layer PostGIS pubblicato per il test, cookie, eccezioni WMS, FeatureInfo, legende |
 
 Gli script vengono letti da `charts/templates/geoserver-configuration/configmap.yaml`: si prova esattamente ciò che gira nel Job.
@@ -34,7 +35,9 @@ npm run test:integration:docker
 ```
 
 Avvia PostGIS e GeoServer con `test/integration/docker-compose.yml`, esegue i test e ferma i container. `KEEP=1` li lascia accesi.
-Servono docker con compose, `psql` e nginx (per `tiles.int.test.ts` e `security.int.test.ts`, che usa anche la build in `dist/`: lo script la crea se manca).
+Servono docker con compose, `psql` e nginx (per `tiles.int.test.ts`, `security.int.test.ts` e `metrics.int.test.ts`, che usano anche la build in `dist/`: lo script la crea se manca).
+`metrics.int.test.ts` vuole anche il modulo njs di nginx (Debian/Ubuntu: `apt-get install libnginx-mod-http-js`; in un percorso
+diverso: `NGINX_JS_MODULE=/percorso/ngx_http_js_module.so`).
 
 Contro servizi già esistenti:
 
